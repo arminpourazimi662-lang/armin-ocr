@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://arminpourazimi662-lang.github.io/armin-ocr/sitemap.xml
