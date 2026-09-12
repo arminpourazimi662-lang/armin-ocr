@@ -16147,18 +16147,9 @@ main,section,article,aside,div{min-width:0}
     (window.location.hash || "").replace(/^#/, "")
   );
   window.ARMIN_USE_INDEPENDENT_RECOVERY =
-    arminRecoveryHashParams.get("type") === "recovery" ||
-    (
-      Boolean(arminRecoveryHashParams.get("access_token")) &&
-      Boolean(arminRecoveryHashParams.get("refresh_token")) &&
-      (() => {
-        try {
-          return localStorage.getItem("arminPasswordRecoveryPending") === "1";
-        } catch (_) {
-          return false;
-        }
-      })()
-    );
+    arminRecoveryHashParams.get("type") === "recovery" &&
+    Boolean(arminRecoveryHashParams.get("access_token")) &&
+    Boolean(arminRecoveryHashParams.get("refresh_token"));
 
   const arminSupabase =
     window.supabase && typeof window.supabase.createClient === "function"
@@ -16675,6 +16666,13 @@ main,section,article,aside,div{min-width:0}
 
   loginForm.addEventListener("submit", async function(event) {
     event.preventDefault();
+
+    const independentRecovery = document.getElementById("arminIndependentRecovery");
+    if (independentRecovery && independentRecovery.classList.contains("is-open")) {
+      event.stopImmediatePropagation();
+      return;
+    }
+
     if (authBusy) return;
 
     if (!arminSupabase) {
@@ -16841,12 +16839,8 @@ main,section,article,aside,div{min-width:0}
       arminSupabase.auth.getSession().then(({ data }) => {
         if (data?.session?.user) {
           cacheSupabaseUser(data.session.user);
-          if (
-            !window.ARMIN_USE_INDEPENDENT_RECOVERY &&
-            localStorage.getItem("arminPasswordRecoveryPending") === "1"
-          ) {
-            setTimeout(function() { openLogin("recovery"); }, 0);
-          }
+          /* Do not open recovery mode from localStorage alone.
+             Only the real recovery URL is allowed to show the new-password form. */
           try { updateProfile(); } catch (_) {}
         } else {
           localStorage.removeItem("iranOCRUser");
@@ -18619,7 +18613,7 @@ main,section,article,aside,div{min-width:0}
     >
 
     <div class="armin-recovery-actions">
-      <button id="arminSaveNewPassword" type="submit">ذخیره / تغییر رمز عبور</button>
+      <button id="arminSaveNewPassword" type="button">ذخیره / تغییر رمز عبور</button>
     </div>
 
     <div id="arminIndependentRecoveryMessage" class="armin-recovery-message" aria-live="polite"></div>
@@ -18644,28 +18638,25 @@ main,section,article,aside,div{min-width:0}
   const refreshToken = hash.get("refresh_token") || "";
   const flowType = (hash.get("type") || "").toLowerCase();
 
-  let recoveryWasRequested = false;
-  try {
-    recoveryWasRequested =
-      localStorage.getItem(RECOVERY_PENDING_KEY) === "1" ||
-      localStorage.getItem("ARMIN_PASSWORD_RECOVERY_PENDING_KEY") === "1";
-  } catch (_) {}
-
   /*
-    Supabase recovery links normally contain type=recovery.
-    The second condition is an extra fallback for the exact hash-token flow
-    used by ARMIN OCR, so the recovery form does not depend on the main app JS.
+    Recovery mode must be triggered ONLY by the actual Supabase recovery URL.
+    A stale localStorage flag must never make the normal homepage ask for a new password.
   */
   const isRecoveryLanding =
     !!accessToken &&
     !!refreshToken &&
     (
       flowType === "recovery" ||
-      recoveryWasRequested ||
       /(?:^|&)type=recovery(?:&|$)/i.test(window.location.hash.replace(/^#/, ""))
     );
 
-  if (!isRecoveryLanding) return;
+  if (!isRecoveryLanding) {
+    try {
+      localStorage.removeItem(RECOVERY_PENDING_KEY);
+      localStorage.removeItem("ARMIN_PASSWORD_RECOVERY_PENDING_KEY");
+    } catch (_) {}
+    return;
+  }
 
   const overlay = document.getElementById("arminIndependentRecovery");
   const form = document.getElementById("arminIndependentRecoveryForm");
@@ -18693,8 +18684,11 @@ main,section,article,aside,div{min-width:0}
     try { password1.focus(); } catch (_) {}
   }, 80);
 
-  form.addEventListener("submit", async function (event) {
-    event.preventDefault();
+  async function saveIndependentRecoveryPassword(event) {
+    if (event) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
 
     const newPassword = String(password1.value || "");
     const repeatedPassword = String(password2.value || "");
@@ -18786,6 +18780,24 @@ main,section,article,aside,div{min-width:0}
       saveButton.disabled = false;
       saveButton.textContent = "ذخیره / تغییر رمز عبور";
     }
+  }
+
+  saveButton.addEventListener("click", saveIndependentRecoveryPassword);
+
+  form.addEventListener("submit", function (event) {
+    event.preventDefault();
+    event.stopPropagation();
+    saveIndependentRecoveryPassword(event);
+  });
+
+  [password1, password2].forEach(function (input) {
+    input.addEventListener("keydown", function (event) {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        event.stopPropagation();
+        saveIndependentRecoveryPassword(event);
+      }
+    });
   });
 })();
 </script>
@@ -19021,26 +19033,38 @@ main,section,article,aside,div{min-width:0}
       openAuth("register");
     }, true);
 
-    dashboardBtn.addEventListener("click", async function (event) {
+    dashboardBtn.addEventListener("click", function (event) {
       event.preventDefault();
       event.stopImmediatePropagation();
 
-      const liveUser = await getCurrentUser();
-
-      if (liveUser) {
-        cacheUser(liveUser);
-        showDashboard(liveUser);
-        return;
-      }
+      /*
+        Never make the dashboard click wait for Supabase.
+        Respond immediately from the local compatibility cache; if there is
+        no cached user, open the login window immediately. Then refresh the
+        real Supabase session in the background.
+      */
+      try {
+        localStorage.setItem("iranOCRDashboardAfterLogin", "1");
+      } catch (_) {}
 
       const cached = readCachedUser();
 
       if (cached) {
         showDashboard(cached);
-        return;
+      } else {
+        openAuth("login");
       }
 
-      openAuth("login");
+      Promise.resolve(getCurrentUser())
+        .then(function (liveUser) {
+          if (!liveUser) return;
+          cacheUser(liveUser);
+          closeAuth();
+          showDashboard(liveUser);
+        })
+        .catch(function () {
+          /* UI already responded; a network/session failure must not freeze it. */
+        });
     }, true);
 
     if (closeBtn) {
@@ -19119,7 +19143,30 @@ main,section,article,aside,div{min-width:0}
 
     form.addEventListener("submit", async function (event) {
       event.preventDefault();
+
+      /*
+        If the original ARMIN auth code has opened the "new password" recovery
+        form, do NOT let this rescue login handler validate email. The recovery
+        link already identifies the user through the Supabase session/token.
+        The original recovery handler must be the only submit handler in that mode.
+      */
+      const loginEmailField = email ? email.closest(".login-field") : null;
+      const legacyRecoveryActive =
+        !!confirmField &&
+        window.getComputedStyle(confirmField).display !== "none" &&
+        !!loginEmailField &&
+        window.getComputedStyle(loginEmailField).display === "none";
+
+      if (legacyRecoveryActive) {
+        return;
+      }
+
       event.stopImmediatePropagation();
+
+      const independentRecovery = document.getElementById("arminIndependentRecovery");
+      if (independentRecovery && independentRecovery.classList.contains("is-open")) {
+        return;
+      }
 
       if (busy) return;
 
@@ -19202,6 +19249,9 @@ main,section,article,aside,div{min-width:0}
           }
 
           cacheUser(loggedUser);
+          try {
+            localStorage.removeItem("iranOCRDashboardAfterLogin");
+          } catch (_) {}
           closeAuth();
           showDashboard(loggedUser);
         }
