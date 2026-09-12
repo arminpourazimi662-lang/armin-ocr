@@ -18840,6 +18840,9 @@ main,section,article,aside,div{min-width:0}
       return;
     }
 
+    /* All auth validation is handled explicitly in JavaScript. */
+    form.noValidate = true;
+
     const SUPABASE_URL =
       window.ARMIN_SUPABASE_URL ||
       "https://wafyvahquagzlsvyhtjk.supabase.co";
@@ -18919,7 +18922,24 @@ main,section,article,aside,div{min-width:0}
     function setMode(nextMode) {
       mode = nextMode === "register" ? "register" : "login";
 
+      /*
+        IMPORTANT:
+        A hidden required username field can stop the browser BEFORE the
+        submit event fires. Keep HTML validation state synchronized with
+        the visible auth mode.
+      */
+      form.noValidate = true;
+
       if (confirmField) confirmField.style.display = "none";
+      if (username) username.required = (mode === "register");
+      if (email) email.required = true;
+      if (password) {
+        password.required = true;
+        password.autocomplete = mode === "login" ? "current-password" : "new-password";
+      }
+
+      const confirmInput = document.getElementById("loginConfirmPassword");
+      if (confirmInput) confirmInput.required = false;
 
       if (mode === "register") {
         if (usernameField) usernameField.style.display = "";
