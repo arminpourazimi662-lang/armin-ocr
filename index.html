@@ -13722,6 +13722,17 @@ main,section,article,aside,div{min-width:0}
         >
       </div>
 
+
+      <div class="login-field" id="loginConfirmPasswordField" style="display:none;">
+        <label for="loginConfirmPassword">تکرار رمز عبور جدید</label>
+        <input
+          type="password"
+          id="loginConfirmPassword"
+          placeholder="تکرار رمز عبور جدید"
+          autocomplete="new-password"
+        >
+      </div>
+
       <button
         type="submit"
         id="loginSubmitBtn"
@@ -16507,6 +16518,13 @@ main,section,article,aside,div{min-width:0}
   const loginPassword =
     document.getElementById("loginPassword");
 
+
+  const loginConfirmPassword =
+    document.getElementById("loginConfirmPassword");
+
+  const loginConfirmPasswordField =
+    document.getElementById("loginConfirmPasswordField");
+
   const loginMessage =
     document.getElementById("loginMessage");
 
@@ -18449,6 +18467,285 @@ main,section,article,aside,div{min-width:0}
   document.addEventListener('pointerdown', () => {
     document.documentElement.classList.remove('armin-keyboard-nav');
   }, { passive:true });
+})();
+</script>
+
+
+<!-- ARMIN OCR: INDEPENDENT PASSWORD RECOVERY BOOTSTRAP -->
+<style id="armin-independent-recovery-style">
+  #arminIndependentRecovery {
+    position: fixed;
+    inset: 0;
+    z-index: 2147483647;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background: rgba(4, 10, 12, .82);
+    backdrop-filter: blur(7px);
+    -webkit-backdrop-filter: blur(7px);
+    direction: rtl;
+  }
+  #arminIndependentRecovery.is-open { display: flex !important; }
+  #arminIndependentRecovery .armin-recovery-card {
+    width: min(480px, 100%);
+    box-sizing: border-box;
+    border: 1px solid rgba(201, 163, 87, .55);
+    border-radius: 22px;
+    padding: 28px;
+    background:
+      linear-gradient(145deg, rgba(19,27,27,.985), rgba(7,13,15,.995));
+    box-shadow: 0 28px 90px rgba(0,0,0,.52);
+    color: #f7f1e5;
+    font-family: "Amiri", serif;
+  }
+  #arminIndependentRecovery h2 {
+    margin: 0 0 8px;
+    font-size: 30px;
+    line-height: 1.4;
+    color: #f3dfaa;
+  }
+  #arminIndependentRecovery .armin-recovery-subtitle {
+    margin: 0 0 22px;
+    color: #d8d0c0;
+    font-size: 17px;
+    line-height: 1.9;
+  }
+  #arminIndependentRecovery label {
+    display: block;
+    margin: 14px 0 6px;
+    color: #f4ead4;
+    font-size: 16px;
+  }
+  #arminIndependentRecovery input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 13px 14px;
+    border: 1px solid rgba(201, 163, 87, .38);
+    border-radius: 12px;
+    outline: none;
+    background: rgba(255,255,255,.055);
+    color: #fff;
+    font: inherit;
+    font-size: 17px;
+  }
+  #arminIndependentRecovery input:focus {
+    border-color: #d7b56a;
+    box-shadow: 0 0 0 3px rgba(215,181,106,.12);
+  }
+  #arminIndependentRecovery .armin-recovery-actions {
+    display: grid;
+    gap: 10px;
+    margin-top: 22px;
+  }
+  #arminIndependentRecovery button {
+    width: 100%;
+    padding: 12px 16px;
+    border: 1px solid #d0ad62;
+    border-radius: 12px;
+    cursor: pointer;
+    background: linear-gradient(180deg, #d6b76f, #b88c3c);
+    color: #111;
+    font: inherit;
+    font-size: 17px;
+    font-weight: 700;
+  }
+  #arminIndependentRecovery button:disabled {
+    cursor: wait;
+    opacity: .65;
+  }
+  #arminIndependentRecovery .armin-recovery-message {
+    min-height: 28px;
+    margin-top: 14px;
+    font-size: 15px;
+    line-height: 1.8;
+  }
+  #arminIndependentRecovery .armin-recovery-message.error { color: #ffb6b6; }
+  #arminIndependentRecovery .armin-recovery-message.ok { color: #b9f2c8; }
+</style>
+
+<div id="arminIndependentRecovery" role="dialog" aria-modal="true" aria-labelledby="arminRecoveryTitle">
+  <form class="armin-recovery-card" id="arminIndependentRecoveryForm" novalidate>
+    <h2 id="arminRecoveryTitle">تعیین رمز عبور جدید</h2>
+    <p class="armin-recovery-subtitle">
+      رمز جدید را وارد کنید و برای اطمینان یک بار دیگر تکرار کنید.
+    </p>
+
+    <label for="arminNewPassword">رمز عبور جدید</label>
+    <input
+      id="arminNewPassword"
+      type="password"
+      minlength="8"
+      autocomplete="new-password"
+      placeholder="حداقل ۸ کاراکتر"
+      required
+    >
+
+    <label for="arminNewPasswordConfirm">تکرار رمز عبور جدید</label>
+    <input
+      id="arminNewPasswordConfirm"
+      type="password"
+      minlength="8"
+      autocomplete="new-password"
+      placeholder="رمز جدید را دوباره وارد کنید"
+      required
+    >
+
+    <div class="armin-recovery-actions">
+      <button id="arminSaveNewPassword" type="submit">ذخیره / تغییر رمز عبور</button>
+    </div>
+
+    <div id="arminIndependentRecoveryMessage" class="armin-recovery-message" aria-live="polite"></div>
+  </form>
+</div>
+
+<script id="armin-independent-recovery-bootstrap">
+(function () {
+  "use strict";
+
+  const SUPABASE_URL = "https://wafyvahquagzlsvyhtjk.supabase.co";
+  const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_NtpaDlXA9vgRj0HoCRWVMQ_gqPDnGl1";
+  const RECOVERY_PENDING_KEY = "arminPasswordRecoveryPending";
+
+  const hash = new URLSearchParams(
+    window.location.hash.startsWith("#")
+      ? window.location.hash.slice(1)
+      : window.location.hash
+  );
+
+  const accessToken = hash.get("access_token") || "";
+  const refreshToken = hash.get("refresh_token") || "";
+  const flowType = (hash.get("type") || "").toLowerCase();
+
+  let recoveryWasRequested = false;
+  try {
+    recoveryWasRequested =
+      localStorage.getItem(RECOVERY_PENDING_KEY) === "1" ||
+      localStorage.getItem("ARMIN_PASSWORD_RECOVERY_PENDING_KEY") === "1";
+  } catch (_) {}
+
+  /*
+    Supabase recovery links normally contain type=recovery.
+    The second condition is an extra fallback for the exact hash-token flow
+    used by ARMIN OCR, so the recovery form does not depend on the main app JS.
+  */
+  const isRecoveryLanding =
+    !!accessToken &&
+    !!refreshToken &&
+    (
+      flowType === "recovery" ||
+      recoveryWasRequested ||
+      /(?:^|&)type=recovery(?:&|$)/i.test(window.location.hash.replace(/^#/, ""))
+    );
+
+  if (!isRecoveryLanding) return;
+
+  const overlay = document.getElementById("arminIndependentRecovery");
+  const form = document.getElementById("arminIndependentRecoveryForm");
+  const password1 = document.getElementById("arminNewPassword");
+  const password2 = document.getElementById("arminNewPasswordConfirm");
+  const saveButton = document.getElementById("arminSaveNewPassword");
+  const message = document.getElementById("arminIndependentRecoveryMessage");
+
+  function showMessage(text, kind) {
+    message.textContent = text || "";
+    message.className = "armin-recovery-message" + (kind ? " " + kind : "");
+  }
+
+  overlay.classList.add("is-open");
+  document.documentElement.style.overflow = "hidden";
+  document.body.style.overflow = "hidden";
+
+  setTimeout(function () {
+    try { password1.focus(); } catch (_) {}
+  }, 80);
+
+  form.addEventListener("submit", async function (event) {
+    event.preventDefault();
+
+    const newPassword = String(password1.value || "");
+    const repeatedPassword = String(password2.value || "");
+
+    if (newPassword.length < 8) {
+      showMessage("رمز عبور جدید باید حداقل ۸ کاراکتر باشد.", "error");
+      password1.focus();
+      return;
+    }
+
+    if (newPassword !== repeatedPassword) {
+      showMessage("تکرار رمز عبور با رمز جدید یکسان نیست.", "error");
+      password2.focus();
+      return;
+    }
+
+    saveButton.disabled = true;
+    saveButton.textContent = "در حال ذخیره…";
+    showMessage("");
+
+    try {
+      const response = await fetch(SUPABASE_URL + "/auth/v1/user", {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          "apikey": SUPABASE_PUBLISHABLE_KEY,
+          "Authorization": "Bearer " + accessToken
+        },
+        body: JSON.stringify({ password: newPassword })
+      });
+
+      let payload = {};
+      try { payload = await response.json(); } catch (_) {}
+
+      if (!response.ok) {
+        const serverMessage =
+          payload && (payload.msg || payload.message || payload.error_description);
+        throw new Error(serverMessage || ("HTTP " + response.status));
+      }
+
+      try {
+        localStorage.removeItem(RECOVERY_PENDING_KEY);
+        localStorage.removeItem("ARMIN_PASSWORD_RECOVERY_PENDING_KEY");
+      } catch (_) {}
+
+      showMessage("رمز عبور با موفقیت تغییر کرد. اکنون می‌توانید با رمز جدید وارد شوید.", "ok");
+      saveButton.textContent = "رمز عبور تغییر کرد";
+
+      try {
+        history.replaceState(
+          {},
+          document.title,
+          window.location.pathname + window.location.search
+        );
+      } catch (_) {}
+
+      setTimeout(function () {
+        document.documentElement.style.overflow = "";
+        document.body.style.overflow = "";
+        overlay.classList.remove("is-open");
+
+        try {
+          if (typeof window.toast === "function") {
+            window.toast("رمز عبور با موفقیت تغییر کرد.");
+          }
+        } catch (_) {}
+      }, 1800);
+
+    } catch (error) {
+      const msg = String(error && error.message ? error.message : error);
+
+      if (/expired|invalid|jwt|token|401|403/i.test(msg)) {
+        showMessage(
+          "لینک بازیابی معتبر نیست یا منقضی شده است. لطفاً یک ایمیل «فراموشی رمز عبور» تازه درخواست کنید.",
+          "error"
+        );
+      } else {
+        showMessage("تغییر رمز عبور انجام نشد: " + msg, "error");
+      }
+
+      saveButton.disabled = false;
+      saveButton.textContent = "ذخیره / تغییر رمز عبور";
+    }
+  });
 })();
 </script>
 
