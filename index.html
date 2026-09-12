@@ -16141,6 +16141,25 @@ main,section,article,aside,div{min-width:0}
   ================================================== */
 
   const ARMIN_SITE_URL = String(window.ARMIN_SITE_URL || "https://arminpourazimi662-lang.github.io/armin-ocr/");
+
+  /* ARMIN: only ONE password-recovery UI should handle a recovery link. */
+  const arminRecoveryHashParams = new URLSearchParams(
+    (window.location.hash || "").replace(/^#/, "")
+  );
+  window.ARMIN_USE_INDEPENDENT_RECOVERY =
+    arminRecoveryHashParams.get("type") === "recovery" ||
+    (
+      Boolean(arminRecoveryHashParams.get("access_token")) &&
+      Boolean(arminRecoveryHashParams.get("refresh_token")) &&
+      (() => {
+        try {
+          return localStorage.getItem("arminPasswordRecoveryPending") === "1";
+        } catch (_) {
+          return false;
+        }
+      })()
+    );
+
   const arminSupabase =
     window.supabase && typeof window.supabase.createClient === "function"
       ? window.supabase.createClient(
@@ -16751,6 +16770,7 @@ main,section,article,aside,div{min-width:0}
   });
 
   async function handleRecoveryLanding() {
+    if (window.ARMIN_USE_INDEPENDENT_RECOVERY) return false;
     if (!arminSupabase) return false;
 
     const currentUrl = new URL(window.location.href);
@@ -16801,7 +16821,11 @@ main,section,article,aside,div{min-width:0}
       if (event === "PASSWORD_RECOVERY") {
         localStorage.setItem("arminPasswordRecoveryPending", "1");
         if (session?.user) cacheSupabaseUser(session.user);
-        setTimeout(function() { openLogin("recovery"); }, 0);
+
+        /* The independent recovery card is the only recovery UI now. */
+        if (!window.ARMIN_USE_INDEPENDENT_RECOVERY) {
+          setTimeout(function() { openLogin("recovery"); }, 0);
+        }
         return;
       }
       if (session?.user) {
@@ -16817,7 +16841,10 @@ main,section,article,aside,div{min-width:0}
       arminSupabase.auth.getSession().then(({ data }) => {
         if (data?.session?.user) {
           cacheSupabaseUser(data.session.user);
-          if (localStorage.getItem("arminPasswordRecoveryPending") === "1") {
+          if (
+            !window.ARMIN_USE_INDEPENDENT_RECOVERY &&
+            localStorage.getItem("arminPasswordRecoveryPending") === "1"
+          ) {
             setTimeout(function() { openLogin("recovery"); }, 0);
           }
           try { updateProfile(); } catch (_) {}
@@ -18652,6 +18679,12 @@ main,section,article,aside,div{min-width:0}
     message.className = "armin-recovery-message" + (kind ? " " + kind : "");
   }
 
+  window.ARMIN_USE_INDEPENDENT_RECOVERY = true;
+
+  /* Hide the legacy auth/recovery modal if an older async handler tried to open it. */
+  const legacyAuthOverlay = document.getElementById("loginOverlay");
+  if (legacyAuthOverlay) legacyAuthOverlay.classList.remove("active");
+
   overlay.classList.add("is-open");
   document.documentElement.style.overflow = "hidden";
   document.body.style.overflow = "hidden";
@@ -18723,6 +18756,9 @@ main,section,article,aside,div{min-width:0}
         document.body.style.overflow = "";
         overlay.classList.remove("is-open");
 
+        const oldOverlay = document.getElementById("loginOverlay");
+        if (oldOverlay) oldOverlay.classList.remove("active");
+
         try {
           if (typeof window.toast === "function") {
             window.toast("رمز عبور با موفقیت تغییر کرد.");
@@ -18733,7 +18769,12 @@ main,section,article,aside,div{min-width:0}
     } catch (error) {
       const msg = String(error && error.message ? error.message : error);
 
-      if (/expired|invalid|jwt|token|401|403/i.test(msg)) {
+      if (/new password should be different from the old password/i.test(msg)) {
+        showMessage(
+          "رمز عبور جدید باید با رمز عبور قبلی متفاوت باشد.",
+          "error"
+        );
+      } else if (/expired|invalid|jwt|token|401|403/i.test(msg)) {
         showMessage(
           "لینک بازیابی معتبر نیست یا منقضی شده است. لطفاً یک ایمیل «فراموشی رمز عبور» تازه درخواست کنید.",
           "error"
@@ -18745,6 +18786,468 @@ main,section,article,aside,div{min-width:0}
       saveButton.disabled = false;
       saveButton.textContent = "ذخیره / تغییر رمز عبور";
     }
+  });
+})();
+</script>
+
+
+<!-- ARMIN OCR: AUTH + DASHBOARD RESCUE -->
+<script id="armin-auth-dashboard-rescue">
+(function () {
+  "use strict";
+
+  function ready(fn) {
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", fn, { once: true });
+    } else {
+      fn();
+    }
+  }
+
+  ready(function () {
+    const createBtn = document.getElementById("createAccountBtn");
+    const dashboardBtn = document.getElementById("dashboardBtn");
+    const overlay = document.getElementById("loginOverlay");
+    const closeBtn = document.getElementById("loginClose");
+    const form = document.getElementById("loginForm");
+    const username = document.getElementById("loginUsername");
+    const email = document.getElementById("loginEmail");
+    const password = document.getElementById("loginPassword");
+    const usernameField = username ? username.closest(".login-field") : null;
+    const confirmField = document.getElementById("loginConfirmPasswordField");
+    const title = document.getElementById("loginTitle");
+    const subtitle = document.getElementById("loginSubtitle");
+    const submitBtn = document.getElementById("loginSubmitBtn");
+    const switchBtn = document.getElementById("registerAccountBtn");
+    const forgotBtn = document.getElementById("forgotPasswordBtn");
+    const message = document.getElementById("loginMessage");
+    const dashboard = document.getElementById("dashboardScreen");
+    const logoutBtn = document.getElementById("logoutBtn");
+
+    if (!createBtn || !dashboardBtn || !overlay || !form || !email || !password) {
+      return;
+    }
+
+    const SUPABASE_URL =
+      window.ARMIN_SUPABASE_URL ||
+      "https://wafyvahquagzlsvyhtjk.supabase.co";
+
+    const SUPABASE_KEY =
+      window.ARMIN_SUPABASE_PUBLISHABLE_KEY ||
+      "sb_publishable_NtpaDlXA9vgRj0HoCRWVMQ_gqPDnGl1";
+
+    const SITE_URL =
+      window.ARMIN_SITE_URL ||
+      "https://arminpourazimi662-lang.github.io/armin-ocr/";
+
+    let client = null;
+    let mode = "login";
+    let busy = false;
+
+    function getClient() {
+      if (client) return client;
+
+      try {
+        if (window.supabase && typeof window.supabase.createClient === "function") {
+          client = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+          return client;
+        }
+      } catch (_) {}
+
+      return null;
+    }
+
+    function setMessage(text, type) {
+      if (!message) return;
+      message.textContent = text || "";
+      message.style.color = type === "error" ? "#c62828" : "#168a4b";
+    }
+
+    function setBusy(value) {
+      busy = !!value;
+      if (submitBtn) submitBtn.disabled = busy;
+      if (switchBtn) switchBtn.disabled = busy;
+      if (forgotBtn) forgotBtn.disabled = busy;
+    }
+
+    function cacheUser(user) {
+      if (!user) return;
+
+      const payload = {
+        id: user.id || "",
+        email: user.email || "",
+        username:
+          (user.user_metadata && (
+            user.user_metadata.username ||
+            user.user_metadata.full_name ||
+            user.user_metadata.name
+          )) ||
+          (user.email ? user.email.split("@")[0] : "کاربر"),
+        avatar:
+          (user.user_metadata && (
+            user.user_metadata.avatar_url ||
+            user.user_metadata.picture
+          )) || ""
+      };
+
+      try {
+        localStorage.setItem("iranOCRUser", JSON.stringify(payload));
+      } catch (_) {}
+    }
+
+    function readCachedUser() {
+      try {
+        const raw = localStorage.getItem("iranOCRUser");
+        return raw ? JSON.parse(raw) : null;
+      } catch (_) {
+        return null;
+      }
+    }
+
+    function setMode(nextMode) {
+      mode = nextMode === "register" ? "register" : "login";
+
+      if (confirmField) confirmField.style.display = "none";
+
+      if (mode === "register") {
+        if (usernameField) usernameField.style.display = "";
+        if (title) title.textContent = "ایجاد حساب آنلاین";
+        if (subtitle) subtitle.textContent =
+          "نام کاربری، ایمیل و رمز عبور را وارد کنید.";
+        if (submitBtn) submitBtn.textContent = "ایجاد حساب";
+        if (switchBtn) {
+          switchBtn.textContent = "قبلاً حساب دارم";
+          switchBtn.style.display = "";
+        }
+        if (forgotBtn) forgotBtn.style.display = "none";
+      } else {
+        if (usernameField) usernameField.style.display = "none";
+        if (title) title.textContent = "ورود به حساب";
+        if (subtitle) subtitle.textContent =
+          "با ایمیل و رمز عبور وارد حساب آنلاین خود شوید.";
+        if (submitBtn) submitBtn.textContent = "ورود";
+        if (switchBtn) {
+          switchBtn.textContent = "ایجاد حساب جدید";
+          switchBtn.style.display = "";
+        }
+        if (forgotBtn) forgotBtn.style.display = "";
+      }
+
+      setMessage("");
+    }
+
+    function openAuth(nextMode) {
+      setMode(nextMode);
+      overlay.classList.add("active");
+      document.body.style.overflow = "hidden";
+
+      setTimeout(function () {
+        try {
+          if (mode === "register" && username) username.focus();
+          else email.focus();
+        } catch (_) {}
+      }, 40);
+    }
+
+    function closeAuth() {
+      overlay.classList.remove("active");
+      document.body.style.overflow = "";
+    }
+
+    function updateDashboardIdentity(user) {
+      const cached = user || readCachedUser();
+      if (!cached) return;
+
+      const emailText =
+        cached.email ||
+        (cached.user_metadata && cached.user_metadata.email) ||
+        "";
+
+      const nameText =
+        cached.username ||
+        (cached.user_metadata && (
+          cached.user_metadata.username ||
+          cached.user_metadata.full_name ||
+          cached.user_metadata.name
+        )) ||
+        (emailText ? emailText.split("@")[0] : "کاربر");
+
+      [
+        "dashboardUserName",
+        "profileName",
+        "dashboardName"
+      ].forEach(function (id) {
+        const el = document.getElementById(id);
+        if (el) el.textContent = nameText;
+      });
+
+      [
+        "dashboardUserEmail",
+        "profileEmail",
+        "dashboardEmail"
+      ].forEach(function (id) {
+        const el = document.getElementById(id);
+        if (el) el.textContent = emailText;
+      });
+    }
+
+    function showDashboard(user) {
+      if (!dashboard) return;
+      updateDashboardIdentity(user);
+      dashboard.classList.add("active");
+      document.body.style.overflow = "hidden";
+    }
+
+    async function getCurrentUser() {
+      const supa = getClient();
+      if (!supa) return null;
+
+      try {
+        const result = await supa.auth.getSession();
+        return result &&
+          result.data &&
+          result.data.session &&
+          result.data.session.user
+          ? result.data.session.user
+          : null;
+      } catch (_) {
+        return null;
+      }
+    }
+
+    createBtn.addEventListener("click", function (event) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      openAuth("register");
+    }, true);
+
+    dashboardBtn.addEventListener("click", async function (event) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+
+      const liveUser = await getCurrentUser();
+
+      if (liveUser) {
+        cacheUser(liveUser);
+        showDashboard(liveUser);
+        return;
+      }
+
+      const cached = readCachedUser();
+
+      if (cached) {
+        showDashboard(cached);
+        return;
+      }
+
+      openAuth("login");
+    }, true);
+
+    if (closeBtn) {
+      closeBtn.addEventListener("click", function (event) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        closeAuth();
+      }, true);
+    }
+
+    overlay.addEventListener("click", function (event) {
+      if (event.target !== overlay) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      closeAuth();
+    }, true);
+
+    if (switchBtn) {
+      switchBtn.addEventListener("click", function (event) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        setMode(mode === "register" ? "login" : "register");
+      }, true);
+    }
+
+    if (forgotBtn) {
+      forgotBtn.addEventListener("click", async function (event) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+
+        if (busy) return;
+
+        const userEmail = String(email.value || "").trim();
+
+        if (!userEmail) {
+          setMessage("ابتدا ایمیل حساب خود را وارد کنید.", "error");
+          email.focus();
+          return;
+        }
+
+        const supa = getClient();
+
+        if (!supa) {
+          setMessage(
+            "اتصال به سامانهٔ حساب‌ها برقرار نشد. صفحه را تازه‌سازی کنید.",
+            "error"
+          );
+          return;
+        }
+
+        setBusy(true);
+        setMessage("در حال ارسال لینک بازیابی رمز…");
+
+        try {
+          localStorage.setItem("arminPasswordRecoveryPending", "1");
+
+          const result = await supa.auth.resetPasswordForEmail(
+            userEmail,
+            { redirectTo: SITE_URL }
+          );
+
+          if (result && result.error) throw result.error;
+
+          setMessage("لینک بازیابی رمز به ایمیل شما فرستاده شد.");
+        } catch (error) {
+          setMessage(
+            (error && error.message) ||
+            "ارسال لینک بازیابی انجام نشد.",
+            "error"
+          );
+        } finally {
+          setBusy(false);
+        }
+      }, true);
+    }
+
+    form.addEventListener("submit", async function (event) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+
+      if (busy) return;
+
+      const supa = getClient();
+
+      if (!supa) {
+        setMessage(
+          "سامانهٔ ورود هنوز آماده نشده است. یک‌بار Ctrl+F5 بزنید.",
+          "error"
+        );
+        return;
+      }
+
+      const userEmail = String(email.value || "").trim();
+      const userPassword = String(password.value || "");
+      const userName = username ? String(username.value || "").trim() : "";
+
+      if (!userEmail) {
+        setMessage("ایمیل را وارد کنید.", "error");
+        email.focus();
+        return;
+      }
+
+      if (userPassword.length < 8) {
+        setMessage("رمز عبور باید حداقل ۸ کاراکتر باشد.", "error");
+        password.focus();
+        return;
+      }
+
+      if (mode === "register" && !userName) {
+        setMessage("نام کاربری را وارد کنید.", "error");
+        if (username) username.focus();
+        return;
+      }
+
+      setBusy(true);
+      setMessage(mode === "register" ? "در حال ایجاد حساب…" : "در حال ورود…");
+
+      try {
+        if (mode === "register") {
+          const result = await supa.auth.signUp({
+            email: userEmail,
+            password: userPassword,
+            options: {
+              data: { username: userName },
+              emailRedirectTo: SITE_URL
+            }
+          });
+
+          if (result && result.error) throw result.error;
+
+          const newUser = result && result.data ? result.data.user : null;
+          const newSession = result && result.data ? result.data.session : null;
+
+          if (newUser) cacheUser(newUser);
+
+          if (newSession && newUser) {
+            closeAuth();
+            showDashboard(newUser);
+          } else {
+            setMessage(
+              "حساب ساخته شد. ایمیل تأیید را باز کنید و سپس وارد شوید."
+            );
+            setMode("login");
+            email.value = userEmail;
+          }
+        } else {
+          const result = await supa.auth.signInWithPassword({
+            email: userEmail,
+            password: userPassword
+          });
+
+          if (result && result.error) throw result.error;
+
+          const loggedUser =
+            result && result.data ? result.data.user : null;
+
+          if (!loggedUser) {
+            throw new Error("ورود انجام نشد.");
+          }
+
+          cacheUser(loggedUser);
+          closeAuth();
+          showDashboard(loggedUser);
+        }
+      } catch (error) {
+        let text =
+          (error && error.message) ||
+          "عملیات انجام نشد.";
+
+        if (/invalid login credentials/i.test(text)) {
+          text = "ایمیل یا رمز عبور نادرست است.";
+        } else if (/email not confirmed/i.test(text)) {
+          text = "ابتدا ایمیل خود را تأیید کنید.";
+        } else if (/user already registered/i.test(text)) {
+          text = "این ایمیل قبلاً ثبت‌نام شده است.";
+        }
+
+        setMessage(text, "error");
+      } finally {
+        setBusy(false);
+      }
+    }, true);
+
+    if (logoutBtn) {
+      logoutBtn.addEventListener("click", async function (event) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+
+        try {
+          const supa = getClient();
+          if (supa) await supa.auth.signOut();
+        } catch (_) {}
+
+        try {
+          localStorage.removeItem("iranOCRUser");
+        } catch (_) {}
+
+        if (dashboard) dashboard.classList.remove("active");
+        document.body.style.overflow = "";
+      }, true);
+    }
+
+    /* Keep the compatibility cache aligned with a real Supabase session. */
+    (async function () {
+      const liveUser = await getCurrentUser();
+      if (liveUser) cacheUser(liveUser);
+    })();
   });
 })();
 </script>
