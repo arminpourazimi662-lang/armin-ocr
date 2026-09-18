@@ -1,3 +1,4 @@
+```
 <!doctype html>
 <!-- PAZAND — Stage 2 Server-First Main Integration v1 — Gates A-E validated — 2026-09-14 -->
 <!-- PAZAND FAST v11 TURBO — Accuracy v17 Historical Persian Retrieval Model; Stage 5A; speed path frozen -->
@@ -9340,6 +9341,11 @@ textarea:focus-visible{
   filter:
     drop-shadow(0 0 4px rgba(229,196,126,.42))
     drop-shadow(0 3px 8px rgba(0,0,0,.10));
+}
+
+/* completed griffin: restrained museum-like finish */
+#arminScrollSigil.complete line{
+  filter:drop-shadow(0 0 3px rgba(224,187,112,.16));
 }
 
 #arminScrollSigil .gold{stroke:var(--sigil-gold)}
@@ -20309,13 +20315,21 @@ event === "INITIAL_SESSION"
   }
 
   async function arminEnsureFastPDFEngine() {
-    const ready = await ensurePDFEnginesForPreindex();
-    if (!ready) {
+    /*
+      FIX — Archive/Personal Library engine bootstrap
+      This bridge lives in the first PDF module, while the single-PDF preindex
+      helper belongs to a later module and is not in this lexical scope. Calling
+      ensurePDFEnginesForPreindex() here caused:
+      "ensurePDFEnginesForPreindex is not defined".
+      The archive needs PDF.js here, so we load the local PDF.js engine directly.
+    */
+    try {
+      if (!pdfjsLib) {
+        await ensurePdfJs();
+      }
+    } catch (error) {
+      console.error("ARMIN/Pazand PDF engine bootstrap failed:", error);
       throw new Error("موتور PDF/OCR آماده نشد. اتصال اینترنت را بررسی کنید و دوباره تلاش کنید.");
-    }
-
-    if (!pdfjsLib) {
-      await ensurePdfJs();
     }
 
     if (!pdfjsLib) {
@@ -20323,6 +20337,288 @@ event === "INITIAL_SESSION"
     }
 
     return true;
+  }
+
+  const ARMIN_RANGE_PDF_THRESHOLD = 64 * 1024 * 1024;
+  const ARMIN_RANGE_CHUNK_SIZE = 1024 * 1024;
+
+  function arminCreateFileRangeTransport(file) {
+    if (!pdfjsLib?.PDFDataRangeTransport) return null;
+
+    class LocalFileRangeTransport extends pdfjsLib.PDFDataRangeTransport {
+      constructor(sourceFile) {
+        super(
+          Number(sourceFile.size) || 0,
+          null,
+          false,
+          sourceFile.name || "document.pdf"
+        );
+        this.sourceFile = sourceFile;
+        this.aborted = false;
+      }
+
+      requestDataRange(begin, end) {
+        if (this.aborted) return;
+
+        const safeBegin = Math.max(0, Number(begin) || 0);
+        const safeEnd = Math.max(
+          safeBegin,
+          Math.min(Number(end) || safeBegin, Number(this.sourceFile.size) || 0)
+        );
+
+        this.sourceFile
+          .slice(safeBegin, safeEnd)
+          .arrayBuffer()
+          .then(buffer => {
+            if (this.aborted) return;
+            this.onDataRange(safeBegin, new Uint8Array(buffer));
+          })
+          .catch(error => {
+            console.error("PAZAND local PDF range read failed:", error);
+          });
+      }
+
+      abort() {
+        this.aborted = true;
+      }
+    }
+
+    return new LocalFileRangeTransport(file);
+  }
+
+  async function arminOpenPDFDocumentSmart(file) {
+    if (!file) throw new Error("فایل PDF در دسترس نیست.");
+    await arminEnsureFastPDFEngine();
+
+    const useRange =
+      Number(file.size) >= ARMIN_RANGE_PDF_THRESHOLD &&
+      Boolean(pdfjsLib?.PDFDataRangeTransport);
+
+    if (useRange) {
+      const range = arminCreateFileRangeTransport(file);
+      if (range) {
+        const loadingTask = pdfjsLib.getDocument({
+          range,
+          length: Number(file.size) || 0,
+          rangeChunkSize: ARMIN_RANGE_CHUNK_SIZE,
+          disableStream: true,
+          disableAutoFetch: true
+        });
+        const pdf = await loadingTask.promise;
+        pdf.__pazandRangeTransport = range;
+        return pdf;
+      }
+    }
+
+    const buffer = await file.arrayBuffer();
+    return await pdfjsLib.getDocument({
+      data: new Uint8Array(buffer)
+    }).promise;
+  }
+
+  async function arminDestroyPDFDocument(pdf) {
+    if (!pdf) return;
+    try {
+      if (pdf.__pazandRangeTransport?.abort) {
+        pdf.__pazandRangeTransport.abort();
+      }
+    } catch (_) {}
+    try { await pdf.destroy(); } catch (_) {}
+  }
+
+  async function arminInspectPDFFile(file) {
+    const pdf = await arminOpenPDFDocumentSmart(file);
+    try {
+      return {
+        totalPages: Number(pdf.numPages) || 0,
+        rangeLoaded: Number(file?.size) >= ARMIN_RANGE_PDF_THRESHOLD
+      };
+    } finally {
+      await arminDestroyPDFDocument(pdf);
+    }
+  }
+
+  async function arminIndexArchivePageTextOnly(file, pdf, pageNumber, options = {}) {
+    if (!file || !pdf) throw new Error("PDF برای نمایه‌سازی صفحه آماده نیست.");
+
+    const safePage = Math.max(1, Math.min(Number(pageNumber) || 1, pdf.numPages));
+    const pdfPage = await pdf.getPage(safePage);
+
+    try {
+      const textContent = await pdfPage.getTextContent({
+        normalizeWhitespace: true,
+        disableCombineTextItems: false
+      });
+      const items = (textContent.items || []).filter(item =>
+        item &&
+        typeof item.str === "string" &&
+        item.str.trim().length > 0 &&
+        Array.isArray(item.transform)
+      );
+
+      const nativeTextLength = getPageNativeTextLength(items);
+      if (nativeTextLength > 0) {
+        return {
+          kind: "text",
+          textLayerOnly: true,
+          items
+        };
+      }
+
+      const viewport = pdfPage.getViewport({ scale: 1 });
+      return {
+        kind: "scan",
+        scanPending: true,
+        textLayerOnly: true,
+        words: [],
+        fastSearchText: "",
+        scale: 1,
+        width: Number(viewport?.width) || 0,
+        height: Number(viewport?.height) || 0,
+        layout: { mode: "ocr-deferred", regionCount: 0 },
+        quality: { averageConfidence: 0, wordCount: 0, profile: "text-first-no-ocr-v28" }
+      };
+    } finally {
+      try { pdfPage.cleanup(); } catch (_) {}
+    }
+  }
+
+  async function arminIndexArchivePageForceOCR(file, pdf, pageNumber, options = {}) {
+    if (!file || !pdf) throw new Error("PDF برای OCR صفحه آماده نیست.");
+
+    const safePage = Math.max(1, Math.min(Number(pageNumber) || 1, pdf.numPages));
+    const pdfPage = await pdf.getPage(safePage);
+    const fileKey = makePDFIndexProfileKey(file, PDF_INDEX_PROFILE_ARCHIVE);
+
+    try {
+      const cached = options.ignoreOCRCache === true
+        ? null
+        : await getPersistentOCRPage(fileKey, safePage);
+      if (cached && Array.isArray(cached.words) && cached.scale) {
+        return cached;
+      }
+
+      let scanned;
+      if (options.fastSearchOCR === true) {
+        // v28 turbo-search path: use the fast page OCR directly.
+        // The slower layout-aware/dual-pass OCR remains available for explicit full OCR,
+        // but search must return usable results quickly and progressively.
+        scanned = await OCRScannedPDFPageFast(
+          pdfPage,
+          safePage,
+          pdf.numPages
+        );
+        scanned.layout = scanned.layout || { mode: "fast-search-page", regionCount: 1 };
+        scanned.quality = Object.assign({}, scanned.quality || {}, {
+          averageConfidence: averageOCRConfidence(scanned.words || []),
+          wordCount: (scanned.words || []).length,
+          profile: "turbo-search-ocr-v28"
+        });
+      } else {
+        try {
+          scanned = await OCRScannedPDFPageLayoutAware(
+            pdfPage,
+            safePage,
+            pdf.numPages
+          );
+        } catch (layoutError) {
+          console.warn("PAZAND force OCR fallback:", layoutError);
+          scanned = await OCRScannedPDFPageFast(
+            pdfPage,
+            safePage,
+            pdf.numPages
+          );
+          scanned.layout = { mode: "fallback-page", regionCount: 1 };
+          scanned.quality = {
+            averageConfidence: averageOCRConfidence(scanned.words || []),
+            wordCount: (scanned.words || []).length,
+            profile: "fallback-v26-force-ocr"
+          };
+        }
+      }
+
+      if (options.persistOCRCache !== false) {
+        await putPersistentOCRPage(fileKey, safePage, scanned);
+      }
+      return scanned;
+    } finally {
+      try { pdfPage.cleanup(); } catch (_) {}
+    }
+  }
+
+  async function arminIndexArchivePage(file, pdf, pageNumber, options = {}) {
+    if (!file || !pdf) throw new Error("PDF برای نمایه‌سازی صفحه آماده نیست.");
+
+    const safePage = Math.max(1, Math.min(Number(pageNumber) || 1, pdf.numPages));
+    const pdfPage = await pdf.getPage(safePage);
+    const fileKey = makePDFIndexProfileKey(file, PDF_INDEX_PROFILE_ARCHIVE);
+
+    try {
+      const textContent = await pdfPage.getTextContent();
+      const items = textContent.items.filter(item =>
+        item &&
+        typeof item.str === "string" &&
+        item.str.length > 0 &&
+        Array.isArray(item.transform)
+      );
+
+      const nativeTextLength = getPageNativeTextLength(items);
+      if (nativeTextLength >= 24) {
+        return { kind: "text", items };
+      }
+
+      const cached = await getPersistentOCRPage(fileKey, safePage);
+      if (cached && Array.isArray(cached.words) && cached.scale) {
+        return cached;
+      }
+
+      let scanned;
+      try {
+        scanned = await OCRScannedPDFPageLayoutAware(
+          pdfPage,
+          safePage,
+          pdf.numPages
+        );
+      } catch (layoutError) {
+        console.warn("PAZAND large-library OCR fallback:", layoutError);
+        scanned = await OCRScannedPDFPageFast(
+          pdfPage,
+          safePage,
+          pdf.numPages
+        );
+        scanned.layout = { mode: "fallback-page", regionCount: 1 };
+        scanned.quality = {
+          averageConfidence: averageOCRConfidence(scanned.words || []),
+          wordCount: (scanned.words || []).length,
+          profile: "fallback-v18"
+        };
+      }
+
+      if (options.persistOCRCache !== false) {
+        await putPersistentOCRPage(fileKey, safePage, scanned);
+      }
+      return scanned;
+    } finally {
+      try { pdfPage.cleanup(); } catch (_) {}
+    }
+  }
+
+  function arminSearchPageIndexObject(pageIndex, wantedWord) {
+    const wanted = String(wantedWord || "").trim();
+    if (!wanted) return { exactCount: 0, probableCount: 0 };
+    if (!pageIndex) return { exactCount: 0, probableCount: 0 };
+
+    if (pageIndex.kind === "text") {
+      return {
+        exactCount: arminCountTextPageMatches(pageIndex, wanted),
+        probableCount: 0
+      };
+    }
+
+    return {
+      exactCount: arminCountScannedPageMatches(pageIndex, wanted, "exact"),
+      probableCount: arminCountScannedPageMatches(pageIndex, wanted, "probable")
+    };
   }
 
   async function arminGetIndexForFile(file) {
@@ -20336,16 +20632,16 @@ event === "INITIAL_SESSION"
       return pdfSearchIndexMemory.get(fileKey);
     }
 
-    const buffer = await file.arrayBuffer();
-    const pdf = await pdfjsLib.getDocument({
-      data: new Uint8Array(buffer)
-    }).promise;
-
-    return getOrBuildPDFSearchIndex(
-      file,
-      pdf,
-      PDF_INDEX_PROFILE_ARCHIVE
-    );
+    const pdf = await arminOpenPDFDocumentSmart(file);
+    try {
+      return await getOrBuildPDFSearchIndex(
+        file,
+        pdf,
+        PDF_INDEX_PROFILE_ARCHIVE
+      );
+    } finally {
+      await arminDestroyPDFDocument(pdf);
+    }
   }
 
   function arminSearchIndexObject(index, wantedWord) {
@@ -20413,17 +20709,15 @@ event === "INITIAL_SESSION"
     wantedWord,
     canvas,
     maxWidth,
-    matchMode = "exact"
+    matchMode = "exact",
+    pageIndexOverride = null
   ) {
     if (!file) throw new Error("فایل PDF در دسترس نیست.");
     if (!canvas) throw new Error("Canvas نمایشگر در دسترس نیست.");
 
     await arminEnsureFastPDFEngine();
 
-    const buffer = await file.arrayBuffer();
-    const pdf = await pdfjsLib.getDocument({
-      data: new Uint8Array(buffer)
-    }).promise;
+    const pdf = await arminOpenPDFDocumentSmart(file);
 
     const safePage = Math.max(1, Math.min(Number(pageNumber) || 1, pdf.numPages));
     const page = await pdf.getPage(safePage);
@@ -20451,8 +20745,8 @@ event === "INITIAL_SESSION"
     let highlightCount = 0;
 
     if (wanted) {
-      const index = await arminGetIndexForFile(file);
-      const pageIndex = index?.pages?.[safePage - 1];
+      const pageIndex = pageIndexOverride ||
+        (await arminGetIndexForFile(file))?.pages?.[safePage - 1];
 
       if (matchMode === "probable") {
         ctx.fillStyle = "rgba(255,142,112,.28)";
@@ -20523,7 +20817,7 @@ event === "INITIAL_SESSION"
     ctx.restore();
 
     const totalPages = pdf.numPages;
-    try { await pdf.destroy(); } catch {}
+    await arminDestroyPDFDocument(pdf);
 
     return {
       pageNumber: safePage,
@@ -20554,10 +20848,7 @@ event === "INITIAL_SESSION"
 
     await arminEnsureFastPDFEngine();
 
-    const buffer = await file.arrayBuffer();
-    const pdf = await pdfjsLib.getDocument({
-      data: new Uint8Array(buffer)
-    }).promise;
+    const pdf = await arminOpenPDFDocumentSmart(file);
 
     const grouped = new Map();
 
@@ -20675,7 +20966,7 @@ event === "INITIAL_SESSION"
         try { page.cleanup(); } catch {}
       }
     } finally {
-      try { await pdf.destroy(); } catch {}
+      await arminDestroyPDFDocument(pdf);
     }
 
     return output;
@@ -20716,6 +21007,13 @@ event === "INITIAL_SESSION"
       }
     },
     getIndex: arminGetIndexForFile,
+    openDocument: arminOpenPDFDocumentSmart,
+    destroyDocument: arminDestroyPDFDocument,
+    inspectFile: arminInspectPDFFile,
+    indexPage: arminIndexArchivePage,
+    indexPageOCR: arminIndexArchivePageForceOCR,
+    indexPageTextOnly: arminIndexArchivePageTextOnly,
+    searchPageIndex: arminSearchPageIndexObject,
     searchIndex: arminSearchIndexObject,
     searchFile: arminSearchOnePDF,
     renderPage: arminRenderOriginalPage,
@@ -24548,6 +24846,7 @@ const par = Number(word.parNum) || 0;
   const ARMIN_TRAINING_PACK_VERSION = "22.0";
 
   const input = document.getElementById("libraryFilesInput");
+  const addFilesControl = document.querySelector('label[for="libraryFilesInput"]');
   const folderFallbackInput = document.getElementById("libraryFolderFallbackInput");
   const folderBtn = document.getElementById("libraryFolderBtn");
   const searchInput = document.getElementById("librarySearchWord");
@@ -24616,7 +24915,21 @@ const par = Number(word.parNum) || 0;
   if (!input || !searchInput || !searchBtn || !indexAllBtn || !docsEl || !resultsEl) return;
 
   const LIB_DB = "armin-personal-library-v1";
+  const LIB_DB_VERSION = 2;
   const LIB_STORE = "documents";
+  const LIB_PAGE_STORE = "pageShards";
+  const LIB_PAGE_SHARD_VERSION = "pazand-v28-turbo-ocr-search";
+  const LIB_LARGE_FILE_BYTES = 192 * 1024 * 1024;
+  const LIB_INSPECT_FILE_BYTES = 48 * 1024 * 1024;
+  const LIB_LARGE_PAGE_THRESHOLD = 180;
+  const LIB_CHUNKED_PARALLEL_PAGES = Math.max(2, Math.min(8, Number(navigator.hardwareConcurrency) || 4));
+  const LIB_SEARCH_YIELD_EVERY = 80;
+  // v28: OCR during search is intentionally bounded and resumable.
+  // A 600+ page scanned newspaper must not keep the UI waiting until the whole book is OCRed.
+  const LIB_ON_DEMAND_OCR_MAX_PAGES = 24;
+  const LIB_ON_DEMAND_OCR_SMALL_MAX_PAGES = 80;
+  const LIB_ON_DEMAND_OCR_TIME_BUDGET_MS = 45000;
+  const LIB_ON_DEMAND_OCR_MAX_BYTES = 80 * 1024 * 1024;
 
   let libraryRecords = [];
   const libraryRuntimeFiles = new Map();
@@ -24677,12 +24990,16 @@ const par = Number(word.parNum) || 0;
 
     libraryDBPromise = new Promise(resolve => {
       try {
-        const request = indexedDB.open(LIB_DB, 1);
+        const request = indexedDB.open(LIB_DB, LIB_DB_VERSION);
 
         request.onupgradeneeded = () => {
           const db = request.result;
           if (!db.objectStoreNames.contains(LIB_STORE)) {
             db.createObjectStore(LIB_STORE, { keyPath: "id" });
+          }
+          if (!db.objectStoreNames.contains(LIB_PAGE_STORE)) {
+            const pageStore = db.createObjectStore(LIB_PAGE_STORE, { keyPath: "key" });
+            pageStore.createIndex("recordId", "recordId", { unique: false });
           }
         };
 
@@ -24746,20 +25063,154 @@ const par = Number(word.parNum) || 0;
     });
   }
 
-  async function dbDelete(id) {
+  function pageShardKey(recordId, pageNumber) {
+    return String(recordId) + "\u001f" + String(Math.max(1, Number(pageNumber) || 1));
+  }
+
+  function isQuotaError(error) {
+    return Boolean(
+      error &&
+      (error.name === "QuotaExceededError" ||
+       error.name === "NS_ERROR_DOM_QUOTA_REACHED" ||
+       /quota|storage/i.test(String(error.message || "")))
+    );
+  }
+
+  async function dbPutPageShard(record, pageNumber, pageIndex) {
+    const db = await openLibraryDB();
+    if (!db) throw new Error("IndexedDB برای ذخیرۀ صفحه در دسترس نیست.");
+
+    return new Promise((resolve, reject) => {
+      try {
+        const tx = db.transaction(LIB_PAGE_STORE, "readwrite");
+        tx.objectStore(LIB_PAGE_STORE).put({
+          key: pageShardKey(record.id, pageNumber),
+          recordId: record.id,
+          pageNumber: Math.max(1, Number(pageNumber) || 1),
+          engineVersion: ARMIN_ARCHIVE_INDEX_VERSION,
+          storageVersion: LIB_PAGE_SHARD_VERSION,
+          signature: record.signature || "",
+          pageIndex,
+          savedAt: Date.now()
+        });
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error || new Error("ذخیرۀ صفحۀ نمایه ناموفق بود."));
+        tx.onabort = () => reject(tx.error || new Error("ذخیرۀ صفحۀ نمایه لغو شد."));
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+
+  async function dbGetPageShard(recordId, pageNumber) {
+    const db = await openLibraryDB();
+    if (!db) return null;
+
+    return new Promise(resolve => {
+      try {
+        const tx = db.transaction(LIB_PAGE_STORE, "readonly");
+        const request = tx.objectStore(LIB_PAGE_STORE).get(pageShardKey(recordId, pageNumber));
+        request.onsuccess = () => resolve(request.result || null);
+        request.onerror = () => resolve(null);
+      } catch {
+        resolve(null);
+      }
+    });
+  }
+
+  async function dbCountPageShards(recordId) {
+    const db = await openLibraryDB();
+    if (!db) return 0;
+
+    return new Promise(resolve => {
+      try {
+        const tx = db.transaction(LIB_PAGE_STORE, "readonly");
+        const store = tx.objectStore(LIB_PAGE_STORE);
+        if (!store.indexNames.contains("recordId")) return resolve(0);
+        const request = store.index("recordId").count(IDBKeyRange.only(recordId));
+        request.onsuccess = () => resolve(Number(request.result) || 0);
+        request.onerror = () => resolve(0);
+      } catch {
+        resolve(0);
+      }
+    });
+  }
+
+  async function dbVisitPageShards(recordId, visitor) {
+    const db = await openLibraryDB();
+    if (!db) return 0;
+
+    return new Promise((resolve, reject) => {
+      let visited = 0;
+      try {
+        const tx = db.transaction(LIB_PAGE_STORE, "readonly");
+        const store = tx.objectStore(LIB_PAGE_STORE);
+        if (!store.indexNames.contains("recordId")) return resolve(0);
+        const request = store.index("recordId").openCursor(IDBKeyRange.only(recordId));
+
+        request.onsuccess = () => {
+          const cursor = request.result;
+          if (!cursor) return;
+          try {
+            visitor(cursor.value, visited);
+            visited++;
+            cursor.continue();
+          } catch (error) {
+            try { tx.abort(); } catch {}
+            reject(error);
+          }
+        };
+        request.onerror = () => reject(request.error || new Error("خواندن نمایۀ صفحه‌ای ناموفق بود."));
+        tx.oncomplete = () => resolve(visited);
+        tx.onerror = () => reject(tx.error || new Error("خواندن نمایۀ صفحه‌ای ناموفق بود."));
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+
+  async function dbDeletePageShards(recordId) {
     const db = await openLibraryDB();
     if (!db) return;
 
     return new Promise(resolve => {
       try {
-        const tx = db.transaction(LIB_STORE, "readwrite");
-        tx.objectStore(LIB_STORE).delete(id);
+        const tx = db.transaction(LIB_PAGE_STORE, "readwrite");
+        const store = tx.objectStore(LIB_PAGE_STORE);
+        if (!store.indexNames.contains("recordId")) return resolve();
+        const request = store.index("recordId").openCursor(IDBKeyRange.only(recordId));
+        request.onsuccess = () => {
+          const cursor = request.result;
+          if (!cursor) return;
+          cursor.delete();
+          cursor.continue();
+        };
         tx.oncomplete = () => resolve();
         tx.onerror = () => resolve();
+        tx.onabort = () => resolve();
       } catch {
         resolve();
       }
     });
+  }
+
+  async function dbDelete(id) {
+    const db = await openLibraryDB();
+    if (!db) return;
+
+    await new Promise(resolve => {
+      try {
+        const tx = db.transaction(LIB_STORE, "readwrite");
+        tx.objectStore(LIB_STORE).delete(id);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => resolve();
+        tx.onabort = () => resolve();
+      } catch {
+        resolve();
+      }
+    });
+
+    await dbDeletePageShards(id);
   }
 
   async function dbClear() {
@@ -24768,10 +25219,14 @@ const par = Number(word.parNum) || 0;
 
     return new Promise(resolve => {
       try {
-        const tx = db.transaction(LIB_STORE, "readwrite");
+        const stores = [LIB_STORE];
+        if (db.objectStoreNames.contains(LIB_PAGE_STORE)) stores.push(LIB_PAGE_STORE);
+        const tx = db.transaction(stores, "readwrite");
         tx.objectStore(LIB_STORE).clear();
+        if (stores.includes(LIB_PAGE_STORE)) tx.objectStore(LIB_PAGE_STORE).clear();
         tx.oncomplete = () => resolve();
         tx.onerror = () => resolve();
+        tx.onabort = () => resolve();
       } catch {
         resolve();
       }
@@ -24847,6 +25302,205 @@ const par = Number(word.parNum) || 0;
       String(Number(file?.size) || 0),
       String(Number(file?.lastModified) || 0)
     ].join("|");
+  }
+
+  function isChunkedIndex(index, engineVersion = ARMIN_ARCHIVE_INDEX_VERSION) {
+    return Boolean(
+      index &&
+      index.chunked === true &&
+      index.engineVersion === engineVersion &&
+      index.storageVersion === LIB_PAGE_SHARD_VERSION &&
+      Number(index.totalPages) > 0
+    );
+  }
+
+  function isRecordIndexReady(record, engineVersion = ARMIN_ARCHIVE_INDEX_VERSION) {
+    const index = record?.index;
+    if (!index || index.engineVersion !== engineVersion) return false;
+    if (Array.isArray(index.pages)) return true;
+    return Boolean(
+      isChunkedIndex(index, engineVersion) &&
+      index.status === "ready" &&
+      Number(index.completedPages) >= Number(index.totalPages)
+    );
+  }
+
+  function reverseUnicodeText(value) {
+    return Array.from(String(value || "")).reverse().join("");
+  }
+
+  function libraryPageFragments(pageIndex) {
+    if (!pageIndex) return [];
+    if (Array.isArray(pageIndex.searchFragments)) return pageIndex.searchFragments;
+
+    if (pageIndex.kind === "text") {
+      return (pageIndex.items || [])
+        .map(item => item && typeof item.str === "string" ? item.str : "")
+        .filter(Boolean);
+    }
+
+    if (pageIndex.kind === "scan") {
+      return (pageIndex.words || [])
+        .map(word => word?.norm || word?.text || "")
+        .filter(Boolean);
+    }
+
+    return [];
+  }
+
+  function buildFastSearchBundleFromFragments(fragments) {
+    const list = Array.from(fragments || []).map(item => String(item || "")).filter(Boolean);
+    const spacedRaw = list.join(" ");
+    const compactRaw = list.join("");
+    const spaced = libraryNormalizeText(spacedRaw);
+    const compact = libraryNormalizeToken(compactRaw || spacedRaw);
+    const reverseCompact = libraryNormalizeToken(reverseUnicodeText(compact));
+    return { spaced, compact, reverseCompact };
+  }
+
+  function getPageFastSearchBundle(pageIndex) {
+    if (!pageIndex) return { spaced: "", compact: "", reverseCompact: "" };
+
+    const spaced = typeof pageIndex.fastSearchText === "string" ? pageIndex.fastSearchText : "";
+    const compact = typeof pageIndex.fastSearchCompact === "string" ? pageIndex.fastSearchCompact : "";
+    const reverseCompact = typeof pageIndex.fastSearchReverseCompact === "string" ? pageIndex.fastSearchReverseCompact : "";
+    if (spaced || compact || reverseCompact) {
+      return { spaced, compact, reverseCompact };
+    }
+
+    const bundle = buildFastSearchBundleFromFragments(libraryPageFragments(pageIndex));
+    try {
+      pageIndex.fastSearchText = bundle.spaced;
+      pageIndex.fastSearchCompact = bundle.compact;
+      pageIndex.fastSearchReverseCompact = bundle.reverseCompact;
+    } catch {}
+    return bundle;
+  }
+
+  function getPageFastSearchText(pageIndex) {
+    return getPageFastSearchBundle(pageIndex).spaced;
+  }
+
+  function countPlainOccurrences(haystack, needle) {
+    haystack = String(haystack || "");
+    needle = String(needle || "");
+    if (!haystack || !needle) return 0;
+    let count = 0;
+    let start = 0;
+    while (true) {
+      const at = haystack.indexOf(needle, start);
+      if (at === -1) break;
+      count++;
+      start = at + Math.max(1, needle.length);
+    }
+    return count;
+  }
+
+  function countFastTextMatches(pageIndex, wantedWord) {
+    const wanted = libraryNormalizeText(wantedWord);
+    const wantedCompact = libraryNormalizeToken(wantedWord);
+    if (!wanted && !wantedCompact) return 0;
+
+    const bundle = getPageFastSearchBundle(pageIndex);
+    const spacedCount = countPlainOccurrences(bundle.spaced, wanted);
+    if (spacedCount) return spacedCount;
+
+    // PDF.js sometimes returns Persian text as separated glyphs (د ر ی ا) or RTL-reversed glyph order.
+    // The compact lanes below are for search only; they prevent false "not found" results on valid PDF text layers.
+    const compactCount = countPlainOccurrences(bundle.compact, wantedCompact);
+    if (compactCount) return compactCount;
+
+    return countPlainOccurrences(bundle.reverseCompact, wantedCompact);
+  }
+
+  function pageMayContainExact(pageIndex, wantedWord) {
+    const wanted = libraryNormalizeText(wantedWord);
+    const wantedCompact = libraryNormalizeToken(wantedWord);
+    if (!wanted && !wantedCompact) return false;
+    const bundle = getPageFastSearchBundle(pageIndex);
+    return Boolean(
+      (wanted && bundle.spaced.indexOf(wanted) !== -1) ||
+      (wantedCompact && bundle.compact.indexOf(wantedCompact) !== -1) ||
+      (wantedCompact && bundle.reverseCompact.indexOf(wantedCompact) !== -1)
+    );
+  }
+
+  function compactLargePageIndex(pageIndex) {
+    if (!pageIndex) return pageIndex;
+
+    if (pageIndex.kind === "text") {
+      const compactItems = (pageIndex.items || []).map(item => ({
+        str: item?.str || "",
+        width: Number(item?.width) || 0,
+        transform: Array.isArray(item?.transform) ? item.transform.slice(0, 6) : []
+      })).filter(item => item.str);
+      const searchBundle = buildFastSearchBundleFromFragments(compactItems.map(item => item.str));
+      return {
+        kind: "text",
+        compacted: true,
+        fastSearchText: searchBundle.spaced,
+        fastSearchCompact: searchBundle.compact,
+        fastSearchReverseCompact: searchBundle.reverseCompact,
+        searchFragments: compactItems.map(item => item.str),
+        items: compactItems
+      };
+    }
+
+    if (pageIndex.kind === "scan") {
+      const compactWords = (pageIndex.words || []).map(word => ({
+        text: word?.text || "",
+        norm: word?.norm || "",
+        confidence: Number(word?.confidence) || 0,
+        bbox: word?.bbox ? {
+          x0: Number(word.bbox.x0) || 0,
+          y0: Number(word.bbox.y0) || 0,
+          x1: Number(word.bbox.x1) || 0,
+          y1: Number(word.bbox.y1) || 0
+        } : null,
+        consensusCount: Number(word?.consensusCount) || 1,
+        crossEngineConsensus: Boolean(word?.crossEngineConsensus),
+        ensembleConflict: Boolean(word?.ensembleConflict),
+        alternatives: Array.isArray(word?.alternatives)
+          ? word.alternatives.slice(0, 5).map(alt => ({
+              text: alt?.text || "",
+              normalized: alt?.normalized || "",
+              confidence: Number(alt?.confidence) || 0
+            }))
+          : []
+      })).filter(word => word.text && word.bbox);
+      const searchBundle = buildFastSearchBundleFromFragments(compactWords.map(word => word.norm || word.text || ""));
+      return {
+        kind: "scan",
+        compacted: true,
+        scanPending: Boolean(pageIndex.scanPending),
+        textLayerOnly: Boolean(pageIndex.textLayerOnly),
+        fastSearchText: searchBundle.spaced,
+        fastSearchCompact: searchBundle.compact,
+        fastSearchReverseCompact: searchBundle.reverseCompact,
+        searchFragments: compactWords.map(word => word.norm || word.text || ""),
+        scale: Number(pageIndex.scale) || 1,
+        width: Number(pageIndex.width) || 0,
+        height: Number(pageIndex.height) || 0,
+        layout: pageIndex.layout ? {
+          mode: pageIndex.layout.mode || "page",
+          regionCount: Number(pageIndex.layout.regionCount) || 1
+        } : null,
+        quality: pageIndex.quality ? {
+          averageConfidence: Number(pageIndex.quality.averageConfidence) || 0,
+          wordCount: Number(pageIndex.quality.wordCount) || 0,
+          profile: pageIndex.quality.profile || "historical-dual-engine-v18"
+        } : null,
+        words: compactWords
+      };
+    }
+
+    return pageIndex;
+  }
+
+  async function tryPersistStorage() {
+    if (navigator.storage?.persist) {
+      try { await navigator.storage.persist(); } catch {}
+    }
   }
 
   function updateStats() {
@@ -26611,20 +27265,32 @@ item => item.id === recordId
       .map(record => {
         const ready = libraryReadyIds.has(record.id);
         const working = libraryWorkingIds.has(record.id);
+        const chunked = isChunkedIndex(record.index);
+        const pausedChunk = chunked && record.index?.status === "paused";
+        const partialChunk = chunked && !ready && Number(record.index?.completedPages) > 0;
         const legacyIndex = Boolean(
           record.index &&
+          !chunked &&
           Array.isArray(record.index.pages) &&
           record.index.engineVersion !== ARMIN_ARCHIVE_INDEX_VERSION
         );
         const stateClass = ready ? "ready" : working ? "working" : "";
         const stateText = ready
-          ? "نمایهٔ دقیق آماده"
+          ? (chunked ? "نمایهٔ مرحله‌ای کامل آماده" : "نمایهٔ دقیق آماده")
           : working
-            ? "در حال نمایه‌سازی دقیق…"
-            : legacyIndex
-              ? "نیازمند بازنمایه‌سازی دقیق"
-              : "نیازمند نمایه";
-        const sourceText = record.source === "folder" ? "پوشۀ محلی" : "PDF انتخاب‌شده";
+            ? (chunked ? "در حال نمایه‌سازی مرحله‌ای…" : "در حال نمایه‌سازی دقیق…")
+            : pausedChunk || partialChunk
+              ? "ادامه‌پذیر: " + faNum(record.index.completedPages || 0) + " از " + faNum(record.index.totalPages || 0) + " صفحه ذخیره شده"
+              : legacyIndex
+                ? "نیازمند بازنمایه‌سازی دقیق"
+                : "نیازمند نمایه";
+        const sourceText = record.source === "folder"
+          ? "پوشۀ محلی"
+          : record.handle
+            ? "PDF با دسترسی مستقیم"
+            : record.source === "manual-large"
+              ? "PDF بزرگ · بدون کپی در مرورگر"
+              : "PDF انتخاب‌شده";
 
         return `
           <article class="library-doc-item" data-library-id="${escapeHTML(record.id)}">
@@ -26635,6 +27301,7 @@ item => item.id === recordId
                 <small>${humanBytes(record.size)}${record.relativePath ? " · " + escapeHTML(record.relativePath) : ""}</small>
                 <span class="library-doc-state ${stateClass}">${stateText}</span>
                 <span class="library-doc-source">${sourceText}</span>
+                ${chunked ? '<span class="library-layout-badge">حالت فایل بزرگ · ذخیرۀ صفحه‌به‌صفحه</span>' : ''}
                 ${
                   ready && record.index?.ocrProfile === "dual-v18-tesseract-paddle-v5-fa"
                     ? '<span class="library-layout-badge">تشخیص ستون + هم‌سنجی v18</span><span class="library-ensemble-note">چند گذر OCR + رأی‌گیری</span>'
@@ -26809,17 +27476,32 @@ item => item.id === recordId
   }
 
   async function refreshLibrary() {
-    libraryRecords = (await dbGetAll()).filter(item => item && (item.blob || item.handle));
+    libraryRecords = (await dbGetAll()).filter(item =>
+      item &&
+      (item.blob || item.handle || item.source === "manual-large" || item.storageMode === "runtime-only-large" || item.storageMode === "runtime-only-quota")
+    );
     libraryRuntimeFiles.clear();
     libraryReadyIds.clear();
 
     for (const record of libraryRecords) {
-      if (
-        record.index &&
-        Array.isArray(record.index.pages) &&
-        record.index.engineVersion === ARMIN_ARCHIVE_INDEX_VERSION
-      ) {
+      if (isRecordIndexReady(record)) {
         libraryReadyIds.add(record.id);
+        continue;
+      }
+
+      // ضد خطای قطع ناگهانی: اگر همۀ صفحه‌ها قبلاً ذخیره شده‌اند
+      // ولی متادیتای نهایی به هر دلیل روی status=ready ننشسته، اینجا آن را ترمیم می‌کنیم.
+      if (isChunkedIndex(record.index) && Number(record.index.totalPages) > 0) {
+        const shardCount = await dbCountPageShards(record.id);
+        if (shardCount >= Number(record.index.totalPages)) {
+          record.index.completedPages = Number(record.index.totalPages);
+          record.index.lastCompletedPage = Number(record.index.totalPages);
+          record.index.status = "ready";
+          record.index.updatedAt = Date.now();
+          record.indexedAt = record.indexedAt || Date.now();
+          try { await dbPut(record); } catch {}
+          libraryReadyIds.add(record.id);
+        }
       }
     }
 
@@ -26855,20 +27537,23 @@ item => item.id === recordId
       return;
     }
 
-    if (navigator.storage?.persist) {
-      try { await navigator.storage.persist(); } catch {}
-    }
+    await tryPersistStorage();
 
     setProgress(3);
     setLibraryStatus("در حال افزودن " + faNum(pdfs.length) + " فایل…");
 
     let saved = 0;
+    let largeRuntimeOnly = 0;
 
     for (let i = 0; i < pdfs.length; i++) {
       const file = pdfs[i];
       const id = ["manual", file.name, file.size, file.lastModified].join("|");
-
+      const signature = recordSignature(file);
       const old = libraryRecords.find(item => item.id === id);
+      const unchanged = Boolean(old && old.signature === signature);
+      const avoidBlobCopy = Number(file.size) >= LIB_LARGE_FILE_BYTES;
+
+      if (!unchanged) await dbDeletePageShards(id);
 
       const record = {
         id,
@@ -26878,27 +27563,107 @@ item => item.id === recordId
         type: file.type || "application/pdf",
         lastModified: Number(file.lastModified) || Date.now(),
         addedAt: old?.addedAt || Date.now() + i,
-        source: "manual",
-        blob: file,
-        signature: recordSignature(file),
-        index: old?.signature === recordSignature(file) && old?.index?.engineVersion === ARMIN_ARCHIVE_INDEX_VERSION ? old?.index || null : null,
-        indexedAt: old?.signature === recordSignature(file) && old?.index?.engineVersion === ARMIN_ARCHIVE_INDEX_VERSION ? old?.indexedAt || null : null
+        source: avoidBlobCopy ? "manual-large" : "manual",
+        storageMode: avoidBlobCopy ? "runtime-only-large" : "indexeddb-blob",
+        blob: avoidBlobCopy ? null : file,
+        signature,
+        index: unchanged && old?.index?.engineVersion === ARMIN_ARCHIVE_INDEX_VERSION
+          ? old.index
+          : null,
+        indexedAt: unchanged && old?.index?.engineVersion === ARMIN_ARCHIVE_INDEX_VERSION
+          ? old.indexedAt || null
+          : null
       };
 
-      await dbPut(record);
+      try {
+        await dbPut(record);
+      } catch (error) {
+        if (!avoidBlobCopy && isQuotaError(error)) {
+          record.blob = null;
+          record.source = "manual-large";
+          record.storageMode = "runtime-only-quota";
+          await dbPut(record);
+          largeRuntimeOnly++;
+        } else {
+          throw error;
+        }
+      }
+
+      if (avoidBlobCopy) largeRuntimeOnly++;
       libraryRuntimeFiles.set(id, file);
       saved++;
-
       setProgress(Math.round(((i + 1) / pdfs.length) * 100));
     }
 
     input.value = "";
     await refreshLibrary();
+    for (const file of pdfs) {
+      const id = ["manual", file.name, file.size, file.lastModified].join("|");
+      libraryRuntimeFiles.set(id, file);
+    }
     setProgress(0);
 
     setLibraryStatus(
       faNum(saved) +
-      " فایل اضافه شد. «نمایه‌سازی فایل‌های جدید / تغییرکرده» را بزنید."
+      " فایل اضافه شد. «نمایه‌سازی فایل‌های جدید / تغییرکرده» را بزنید." +
+      (largeRuntimeOnly
+        ? " برای " + faNum(largeRuntimeOnly) + " فایل بزرگ، خود PDF داخل IndexedDB کپی نشد تا حافظه و فضای مرورگر پر نشود؛ نمایه به‌صورت صفحه‌به‌صفحه ذخیره می‌شود."
+        : "")
+    );
+  }
+
+  async function saveFileHandles(handles) {
+    const entries = [];
+    for (const handle of Array.from(handles || [])) {
+      if (!handle || handle.kind !== "file") continue;
+      const file = await handle.getFile();
+      if (!(file.type === "application/pdf" || String(file.name || "").toLowerCase().endsWith(".pdf"))) continue;
+      entries.push({ handle, file });
+    }
+
+    if (!entries.length) return;
+    await tryPersistStorage();
+    setLibraryStatus("در حال ثبت مستقیم " + faNum(entries.length) + " PDF…");
+
+    for (let i = 0; i < entries.length; i++) {
+      const { handle, file } = entries[i];
+      const id = ["picked", file.name, file.size, file.lastModified].join("|");
+      const signature = recordSignature(file);
+      const old = libraryRecords.find(item => item.id === id);
+      const unchanged = Boolean(old && old.signature === signature);
+      if (!unchanged) await dbDeletePageShards(id);
+
+      const record = {
+        id,
+        name: file.name || "document.pdf",
+        relativePath: "",
+        size: Number(file.size) || 0,
+        type: file.type || "application/pdf",
+        lastModified: Number(file.lastModified) || Date.now(),
+        addedAt: old?.addedAt || Date.now() + i,
+        source: "handle",
+        storageMode: "file-handle",
+        handle,
+        blob: null,
+        signature,
+        index: unchanged && old?.index?.engineVersion === ARMIN_ARCHIVE_INDEX_VERSION ? old.index : null,
+        indexedAt: unchanged && old?.index?.engineVersion === ARMIN_ARCHIVE_INDEX_VERSION ? old.indexedAt || null : null
+      };
+
+      await dbPut(record);
+      libraryRuntimeFiles.set(id, file);
+      setProgress(Math.round(((i + 1) / entries.length) * 100));
+    }
+
+    await refreshLibrary();
+    for (const { file } of entries) {
+      const id = ["picked", file.name, file.size, file.lastModified].join("|");
+      libraryRuntimeFiles.set(id, file);
+    }
+    setProgress(0);
+    setLibraryStatus(
+      faNum(entries.length) +
+      " PDF با دسترسی مستقیم ثبت شد؛ برای فایل‌های بزرگ این روش بدون کپی‌کردن کل PDF در حافظۀ مرورگر ادامه‌پذیر است."
     );
   }
 
@@ -26950,6 +27715,7 @@ item => item.id === recordId
       const old = libraryRecords.find(r => r.id === id);
 
       const unchanged = old && old.signature === signature;
+      if (!unchanged) await dbDeletePageShards(id);
 
       const record = {
         id,
@@ -26961,6 +27727,7 @@ item => item.id === recordId
         lastModified: Number(file.lastModified) || Date.now(),
         addedAt: old?.addedAt || Date.now() + i,
         source: "folder",
+        storageMode: "file-handle",
         handle: item.handle,
         signature,
         index: unchanged && old?.index?.engineVersion === ARMIN_ARCHIVE_INDEX_VERSION ? old?.index || null : null,
@@ -27004,27 +27771,472 @@ item => item.id === recordId
     }
   }
 
+  async function shouldUseChunkedIndex(record, file, engine) {
+    if (isChunkedIndex(record?.index, engine.version)) return true;
+    if (Number(file?.size) >= LIB_LARGE_FILE_BYTES) return true;
+
+    if (Number(file?.size) >= LIB_INSPECT_FILE_BYTES && typeof engine.inspectFile === "function") {
+      try {
+        const info = await engine.inspectFile(file);
+        return Number(info?.totalPages) >= LIB_LARGE_PAGE_THRESHOLD;
+      } catch (error) {
+        console.warn("PAZAND large-file inspection failed; using normal path:", error);
+      }
+    }
+
+    return false;
+  }
+
+  async function indexRecordChunked(record, file, engine, signature) {
+    if (typeof engine.openDocument !== "function" || typeof engine.indexPage !== "function") {
+      throw new Error("موتور نمایه‌سازی مرحله‌ای آماده نیست. صفحه را یک‌بار با Ctrl+F5 تازه‌سازی کنید.");
+    }
+
+    await tryPersistStorage();
+    const pdf = await engine.openDocument(file);
+    let currentPage = 0;
+
+    try {
+      const totalPages = Math.max(1, Number(pdf.numPages) || 1);
+      const oldMeta = isChunkedIndex(record.index, engine.version) ? record.index : null;
+      const sameCheckpoint = Boolean(
+        oldMeta &&
+        record.signature === signature &&
+        oldMeta.storageVersion === LIB_PAGE_SHARD_VERSION
+      );
+
+      if (!sameCheckpoint) {
+        await dbDeletePageShards(record.id);
+      }
+
+      record.signature = signature;
+      record.size = Number(file.size) || record.size || 0;
+      record.lastModified = Number(file.lastModified) || record.lastModified || Date.now();
+      record.index = {
+        engineVersion: engine.version,
+        searchPolicy: "fast-text-first-turbo-ocr-search-v28",
+        ocrProfile: "text-layer-first-ocr-deferred",
+        ocrDeferred: true,
+        chunked: true,
+        storageVersion: LIB_PAGE_SHARD_VERSION,
+        totalPages,
+        completedPages: sameCheckpoint ? Math.min(Number(oldMeta.completedPages) || 0, totalPages) : 0,
+        status: "indexing",
+        lastCompletedPage: sameCheckpoint ? Number(oldMeta.lastCompletedPage) || 0 : 0,
+        startedAt: oldMeta?.startedAt || Date.now(),
+        updatedAt: Date.now(),
+        parallelPages: LIB_CHUNKED_PARALLEL_PAGES,
+        fastSearchText: true,
+        indexMode: "text-first-fast"
+      };
+      await dbPut(record);
+
+      let completedPages = sameCheckpoint ? await dbCountPageShards(record.id) : 0;
+      const failures = new Set(Array.isArray(record.index.failedPages) ? record.index.failedPages : []);
+      const pageNumbers = Array.from({ length: totalPages }, (_, index) => index + 1);
+      let cursor = 0;
+
+      async function persistProgress(force = false) {
+        record.index.completedPages = completedPages;
+        record.index.lastCompletedPage = Math.max(Number(record.index.lastCompletedPage) || 0, currentPage || 0);
+        record.index.updatedAt = Date.now();
+        record.index.status = "indexing";
+        record.index.failedPages = Array.from(failures).sort((a, b) => a - b);
+        if (force || completedPages % 4 === 0 || completedPages >= totalPages) {
+          await dbPut(record);
+        }
+        setProgress(Math.round((completedPages / totalPages) * 100));
+      }
+
+      async function processPage(pageNumber) {
+        currentPage = pageNumber;
+        const existing = await dbGetPageShard(record.id, pageNumber);
+        if (
+          existing &&
+          existing.engineVersion === engine.version &&
+          existing.storageVersion === LIB_PAGE_SHARD_VERSION &&
+          existing.signature === signature &&
+          existing.pageIndex
+        ) {
+          return { pageNumber, reused: true };
+        }
+
+        setLibraryStatus(
+          "نمایه‌سازی سریع متنی «" + record.name + "» — صفحه " +
+          faNum(pageNumber) + " از " + faNum(totalPages) +
+          "؛ ابتدا متن PDF خوانده می‌شود و در صورت نیاز هنگام جست‌وجو OCR اطمینانی اجرا می‌شود."
+        );
+
+        let pageIndex = null;
+        let pageError = null;
+
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          try {
+            const indexPageFast = (typeof engine.indexPageTextOnly === "function")
+              ? engine.indexPageTextOnly
+              : engine.indexPage;
+            pageIndex = await indexPageFast(
+              file,
+              pdf,
+              pageNumber,
+              { persistOCRCache: false, textOnly: true, skipOCR: true }
+            );
+            pageError = null;
+            break;
+          } catch (error) {
+            pageError = error;
+            const message = String(error?.message || error || "");
+            if (isQuotaError(error) || /out of memory|memory pressure|array buffer|allocation failed/i.test(message)) {
+              throw error;
+            }
+            if (attempt < 2) {
+              setLibraryStatus("تلاش دوباره برای صفحۀ " + faNum(pageNumber) + " از «" + record.name + "»…");
+              await new Promise(resolve => setTimeout(resolve, 120));
+            }
+          }
+        }
+
+        if (!pageIndex) {
+          pageIndex = {
+            kind: "scan",
+            words: [],
+            scale: 1,
+            width: 0,
+            height: 0,
+            failed: true,
+            error: String(pageError?.message || pageError || "page text extraction failed")
+          };
+          failures.add(pageNumber);
+        }
+
+        const compact = compactLargePageIndex(pageIndex);
+        if (pageIndex.failed) {
+          compact.failed = true;
+          compact.error = pageIndex.error || "";
+        }
+
+        try {
+          await dbPutPageShard(record, pageNumber, compact);
+        } catch (error) {
+          if (isQuotaError(error)) {
+            throw new Error(
+              "فضای ذخیره‌سازی مرورگر برای ادامۀ نمایه کافی نیست. " +
+              "پیشرفت تا صفحۀ " + faNum(Math.max(0, completedPages)) + " ذخیره شده است."
+            );
+          }
+          throw error;
+        }
+
+        return { pageNumber, indexed: true };
+      }
+
+      async function runner() {
+        while (cursor < pageNumbers.length) {
+          const pageNumber = pageNumbers[cursor++];
+          const result = await processPage(pageNumber);
+          completedPages++;
+          record.index.lastCompletedPage = Math.max(Number(record.index.lastCompletedPage) || 0, result.pageNumber || 0);
+          await persistProgress(false);
+          if (completedPages % 2 === 0) await new Promise(resolve => setTimeout(resolve, 0));
+        }
+      }
+
+      const runners = Array.from({ length: Math.min(LIB_CHUNKED_PARALLEL_PAGES, pageNumbers.length) }, () => runner());
+      await Promise.all(runners);
+
+      completedPages = await dbCountPageShards(record.id);
+      record.index.completedPages = completedPages;
+      record.index.lastCompletedPage = totalPages;
+      record.index.status = completedPages >= totalPages ? "ready" : "paused";
+      record.index.updatedAt = Date.now();
+      record.indexedAt = Date.now();
+      record.index.failedPages = Array.from(failures).sort((a, b) => a - b);
+      await dbPut(record);
+
+      if (completedPages >= totalPages) {
+        libraryReadyIds.add(record.id);
+      }
+      return record.index;
+
+    } catch (error) {
+      if (record.index && record.index.chunked) {
+        record.index.status = "paused";
+        record.index.updatedAt = Date.now();
+        record.index.resumeFromPage = Math.max(1, currentPage || 1);
+        record.index.lastError = String(error?.message || error || "");
+        record.index.completedPages = await dbCountPageShards(record.id);
+        try { await dbPut(record); } catch (_) {}
+      }
+      throw new Error(
+        (error?.message || "نمایه‌سازی فایل بزرگ متوقف شد.") +
+        " پیشرفت ذخیره شده و با زدن دوبارۀ نمایه‌سازی از همان فایل ادامه می‌یابد."
+      );
+    } finally {
+      if (typeof engine.destroyDocument === "function") {
+        await engine.destroyDocument(pdf);
+      } else {
+        try { await pdf.destroy(); } catch {}
+      }
+    }
+  }
+
+  function isScanPendingPageIndex(pageIndex) {
+    return Boolean(
+      pageIndex &&
+      pageIndex.kind === "scan" &&
+      (pageIndex.scanPending || pageIndex.textLayerOnly || !getPageFastSearchText(pageIndex))
+    );
+  }
+
+  async function countScanPendingPages(record, engine) {
+    if (!isRecordIndexReady(record, engine.version)) return 0;
+    let pending = 0;
+    await dbVisitPageShards(record.id, shard => {
+      if (
+        shard &&
+        shard.engineVersion === engine.version &&
+        shard.storageVersion === LIB_PAGE_SHARD_VERSION &&
+        shard.signature === record.signature &&
+        isScanPendingPageIndex(shard.pageIndex)
+      ) pending++;
+    });
+    return pending;
+  }
+
+  async function runOnDemandOCRForSearch(record, wantedWord, engine) {
+    if (!isRecordIndexReady(record, engine.version)) return null;
+
+    const totalPages = Number(record.index?.totalPages) || 0;
+    if (!totalPages) return null;
+
+    const tokenKey = libraryNormalizeToken(wantedWord) || libraryNormalizeText(wantedWord) || String(wantedWord || "");
+    const rawCandidates = [];
+    await dbVisitPageShards(record.id, shard => {
+      if (
+        !shard ||
+        shard.engineVersion !== engine.version ||
+        shard.storageVersion !== LIB_PAGE_SHARD_VERSION ||
+        shard.signature !== record.signature ||
+        !shard.pageIndex
+      ) return;
+
+      const pageIndex = shard.pageIndex;
+      const pageNumber = Number(shard.pageNumber) || 1;
+      if (pageNumber < 1 || pageNumber > totalPages) return;
+
+      const fastText = getPageFastSearchText(pageIndex);
+      const fastTokenLength = libraryNormalizeToken(fastText).length;
+
+      // Do not redo OCR on pages that already have searchable text proving the query.
+      if (pageMayContainExact(pageIndex, wantedWord)) return;
+
+      if (isScanPendingPageIndex(pageIndex)) {
+        rawCandidates.push({ pageNumber, priority: 0 });
+      } else if (!fastText || fastTokenLength < 32) {
+        rawCandidates.push({ pageNumber, priority: 1 });
+      }
+    });
+
+    rawCandidates.sort((a, b) => (a.priority - b.priority) || (a.pageNumber - b.pageNumber));
+    if (!rawCandidates.length) return null;
+
+    record.index.searchOcrCursors = record.index.searchOcrCursors || {};
+    const lastCursor = Math.max(0, Math.min(totalPages, Number(record.index.searchOcrCursors[tokenKey]) || 0));
+    const afterCursor = rawCandidates.filter(item => item.pageNumber > lastCursor);
+    const beforeCursor = rawCandidates.filter(item => item.pageNumber <= lastCursor);
+    const ordered = afterCursor.concat(beforeCursor);
+
+    const largeRecord = totalPages >= 120 || Number(record.size || 0) >= LIB_ON_DEMAND_OCR_MAX_BYTES;
+    const pageBudget = largeRecord ? LIB_ON_DEMAND_OCR_MAX_PAGES : LIB_ON_DEMAND_OCR_SMALL_MAX_PAGES;
+    const selected = ordered.slice(0, Math.max(1, pageBudget));
+    const deadline = Date.now() + (largeRecord ? LIB_ON_DEMAND_OCR_TIME_BUDGET_MS : LIB_ON_DEMAND_OCR_TIME_BUDGET_MS * 2);
+
+    const file = await getRecordFile(record);
+    const pdf = await engine.openDocument(file);
+    let processed = 0;
+    let lastProcessedPage = lastCursor;
+    const exactPagesFound = [];
+
+    try {
+      for (const item of selected) {
+        if (processed > 0 && Date.now() > deadline) break;
+
+        const pageNumber = item.pageNumber;
+        lastProcessedPage = pageNumber;
+        setLibraryStatus(
+          "OCR سریعِ مرحله‌ای برای «" + wantedWord + "» — " +
+          record.name + "، صفحه " + faNum(pageNumber) + " از " + faNum(totalPages) +
+          "؛ این جست‌وجو فقط یک بستهٔ سریع را بررسی می‌کند و گیر نمی‌کند."
+        );
+        setProgress(Math.max(1, Math.min(99, Math.round((processed / Math.max(1, selected.length)) * 100))));
+
+        let fullPageIndex = null;
+        try {
+          fullPageIndex = (typeof engine.indexPageOCR === "function")
+            ? await engine.indexPageOCR(
+                file,
+                pdf,
+                pageNumber,
+                { persistOCRCache: true, textOnly: false, skipOCR: false, fastSearchOCR: true }
+              )
+            : await engine.indexPage(
+                file,
+                pdf,
+                pageNumber,
+                { persistOCRCache: true, textOnly: false, skipOCR: false, fastSearchOCR: true }
+              );
+        } catch (pageError) {
+          console.warn("PAZAND turbo OCR search failed for page", pageNumber, pageError);
+          processed++;
+          continue;
+        }
+
+        const compact = compactLargePageIndex(fullPageIndex);
+        await dbPutPageShard(record, pageNumber, compact);
+        processed++;
+
+        const exactCount = countFastTextMatches(compact, wantedWord) ||
+          Number(engine.searchPageIndex(compact, wantedWord)?.exactCount || 0);
+
+        if (exactCount > 0) {
+          exactPagesFound.push({ pageNumber, count: exactCount, matchMode: "exact" });
+        }
+
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
+
+      record.index.searchOcrCursors[tokenKey] = lastProcessedPage >= totalPages ? 0 : lastProcessedPage;
+      record.index.updatedAt = Date.now();
+      record.index.ocrDeferred = true;
+      try { await dbPut(record); } catch (_) {}
+
+      const totalFound = exactPagesFound.reduce((sum, page) => sum + Number(page.count || 0), 0);
+      const remaining = Math.max(0, rawCandidates.length - processed);
+      return {
+        skipped: false,
+        processed,
+        partial: remaining > 0,
+        remaining,
+        nextPage: record.index.searchOcrCursors[tokenKey] || 0,
+        found: totalFound > 0 ? { count: totalFound, pages: exactPagesFound.length } : null,
+        exactPages: exactPagesFound
+      };
+    } finally {
+      if (typeof engine.destroyDocument === "function") {
+        await engine.destroyDocument(pdf);
+      } else {
+        try { await pdf.destroy(); } catch {}
+      }
+    }
+  }
+
+  async function searchChunkedRecord(record, wantedWord, engine) {
+    if (!isRecordIndexReady(record, engine.version)) {
+      throw new Error("نمایۀ مرحله‌ای این فایل هنوز کامل نشده است.");
+    }
+
+    const exactPages = [];
+    const probablePages = [];
+    let totalMatches = 0;
+    let probableMatches = 0;
+    let visited = 0;
+    let skippedByFastText = 0;
+    const wantsProbable = Boolean(showProbableInput?.checked);
+
+    await dbVisitPageShards(record.id, shard => {
+      if (
+        !shard ||
+        shard.engineVersion !== engine.version ||
+        shard.storageVersion !== LIB_PAGE_SHARD_VERSION ||
+        shard.signature !== record.signature ||
+        !shard.pageIndex
+      ) return;
+
+      visited++;
+      const pageNumber = Number(shard.pageNumber) || 1;
+      const pageIndex = shard.pageIndex;
+      const exactCandidate = pageMayContainExact(pageIndex, wantedWord);
+
+      let exactCount = 0;
+      let probableCount = 0;
+
+      if (exactCandidate) {
+        // مسیر سریع: اگر fastSearchText تطبیق را نشان داد، اول شمارش سبک انجام می‌دهیم.
+        // برای صفحات اسکن‌شده‌ای که مختصات نتیجه لازم دارند، نمایش صفحه همچنان از موتور اصلی استفاده می‌کند.
+        exactCount = countFastTextMatches(pageIndex, wantedWord);
+        if (!exactCount) {
+          const counts = engine.searchPageIndex(pageIndex, wantedWord);
+          exactCount = Number(counts?.exactCount) || 0;
+          if (wantsProbable) probableCount = Number(counts?.probableCount) || 0;
+        }
+      } else {
+        skippedByFastText++;
+        if (wantsProbable) {
+          const counts = engine.searchPageIndex(pageIndex, wantedWord);
+          probableCount = Number(counts?.probableCount) || 0;
+        }
+      }
+
+      if (wantsProbable && exactCandidate && probableCount === 0) {
+        const counts = engine.searchPageIndex(pageIndex, wantedWord);
+        probableCount = Number(counts?.probableCount) || 0;
+        if (!exactCount) exactCount = Number(counts?.exactCount) || 0;
+      }
+
+      if (exactCount > 0) {
+        exactPages.push({ pageNumber, count: exactCount, matchMode: "exact" });
+        totalMatches += exactCount;
+      }
+      if (wantsProbable && probableCount > 0) {
+        probablePages.push({ pageNumber, count: probableCount, matchMode: "probable" });
+        probableMatches += probableCount;
+      }
+
+      if (visited % LIB_SEARCH_YIELD_EVERY === 0) {
+        // cursorهای IndexedDB خودشان async هستند؛ این marker فقط برای diagnostics نگه داشته می‌شود.
+      }
+    });
+
+    exactPages.sort((a, b) => a.pageNumber - b.pageNumber);
+    probablePages.sort((a, b) => a.pageNumber - b.pageNumber);
+
+    return {
+      engineVersion: engine.version,
+      totalPages: Number(record.index.totalPages) || 0,
+      totalMatches,
+      probableMatches,
+      pages: exactPages,
+      exactPages,
+      probablePages,
+      indexed: true,
+      chunked: true,
+      fastSearchSkippedPages: skippedByFastText
+    };
+  }
+
   async function indexRecord(record) {
     const engine = await waitForPDFEngine();
     const file = await getRecordFile(record);
     const signature = recordSignature(file);
 
     libraryWorkingIds.add(record.id);
+    libraryReadyIds.delete(record.id);
     renderDocuments();
 
     try {
       await engine.ensure();
 
-      if (
-        record.index &&
-        Array.isArray(record.index.pages) &&
-        record.index.engineVersion === engine.version &&
-        record.signature === signature
-      ) {
+      if (record.signature === signature && isRecordIndexReady(record, engine.version)) {
         libraryReadyIds.add(record.id);
         return record.index;
       }
 
+      // v24 speed lock: Personal Library must never run heavy OCR during normal indexing/search.
+      // Every file, small or large, goes through the page-sharded text-first path.
+      // Pages with no native PDF text are marked as scanPending and can be OCRed later by a separate explicit tool.
+      return await indexRecordChunked(record, file, engine, signature);
+
+      await dbDeletePageShards(record.id);
       const index = await engine.getIndex(file);
 
       record.signature = signature;
@@ -27033,7 +28245,18 @@ item => item.id === recordId
       record.index = index;
       record.indexedAt = Date.now();
 
-      await dbPut(record);
+      try {
+        await dbPut(record);
+      } catch (error) {
+        if (record.blob && isQuotaError(error)) {
+          record.blob = null;
+          record.source = "manual-large";
+          record.storageMode = "runtime-only-quota";
+          await dbPut(record);
+        } else {
+          throw error;
+        }
+      }
 
       libraryReadyIds.add(record.id);
       return index;
@@ -27053,47 +28276,76 @@ item => item.id === recordId
     indexAllBtn.disabled = true;
     searchBtn.disabled = true;
     folderBtn.disabled = true;
-
     setProgress(1);
 
     try {
       const engine = await waitForPDFEngine();
       await engine.ensure();
 
+      const queue = libraryRecords
+        .slice()
+        .sort((a, b) => (Number(a.size) || 0) - (Number(b.size) || 0));
+
       let changed = 0;
+      const failures = [];
 
-      for (let i = 0; i < libraryRecords.length; i++) {
-        const record = libraryRecords[i];
-
+      for (let i = 0; i < queue.length; i++) {
+        const record = queue[i];
         setLibraryStatus(
           "بررسی/نمایه‌سازی " + faNum(i + 1) + " از " +
-          faNum(libraryRecords.length) + " — " + record.name
+          faNum(queue.length) + " — " + record.name
         );
 
-        const before = Boolean(record.index && Array.isArray(record.index.pages));
-        await indexRecord(record);
-        if (!before) changed++;
+        const before = isRecordIndexReady(record, engine.version);
+        try {
+          await indexRecord(record);
+          if (!before) changed++;
+        } catch (fileError) {
+          console.error("PAZAND library indexing failed for:", record.name, fileError);
+          failures.push({
+            name: record.name,
+            message: String(fileError?.message || fileError || "خطای نامشخص")
+          });
+        }
 
-        setProgress(Math.round(((i + 1) / libraryRecords.length) * 100));
+        setProgress(Math.round(((i + 1) / queue.length) * 100));
+        await new Promise(resolve => setTimeout(resolve, 0));
       }
 
-      setLibraryStatus(
-        "OCR و نمایهٔ پایه آماده شد؛ در حال ساخت واژه‌نامۀ تطبیقی از خود آرشیو…"
+      const normalReady = libraryRecords.filter(record =>
+        record?.index &&
+        Array.isArray(record.index.pages) &&
+        record.index.engineVersion === engine.version
+      ).length;
+
+      let corpusReport = { lexiconSize: 0, changed: 0, reviewed: 0, updatedRecords: 0 };
+      // Speed lock v23: ساخت واژه‌نامۀ تطبیقی دیگر به‌صورت خودکار بعد از هر نمایه‌سازی اجرا نمی‌شود.
+      // این کار برای آرشیوهای بزرگ زمان‌بر بود و ربطی به آماده‌شدن جست‌وجوی سریع ندارد.
+      // ابزارهای بازبینی/کیفیت همچنان می‌توانند مدل تطبیقی را جداگانه بسازند.
+      if (false && normalReady > 0) {
+        setLibraryStatus(
+          "نمایه‌های پایه آماده‌اند؛ در حال ساخت واژه‌نامۀ تطبیقی از نمایه‌های عادی، بدون OCR دوباره…"
+        );
+        corpusReport = await rebuildAdaptiveCorpusModel();
+      }
+
+      const chunkedReady = libraryRecords.filter(record =>
+        isRecordIndexReady(record, engine.version) &&
+        isChunkedIndex(record.index, engine.version)
+      ).length;
+
+      const failedPages = libraryRecords.reduce(
+        (sum, record) => sum + (Array.isArray(record?.index?.failedPages) ? record.index.failedPages.length : 0),
+        0
       );
 
-      const corpusReport = await rebuildAdaptiveCorpusModel();
-
       setLibraryStatus(
-        "نمایه آماده است: " + faNum(libraryRecords.length) +
-        " فایل. v18 دو‌موتوره + لایۀ تطبیقی v19 ذخیره شد؛ " +
-        faNum(corpusReport.lexiconSize) +
-        " واژۀ مطمئن در واژه‌نامۀ آرشیو ثبت شد" +
-        (
-          corpusReport.changed
-            ? " و " + faNum(corpusReport.changed) +
-              " خوانش مبهم فقط میان گزینه‌های واقعی OCR با احتیاط اصلاح شد."
-            : "؛ هیچ خوانش مبهمی شرایط سخت‌گیرانۀ اصلاح خودکار را نداشت."
-        )
+        "نمایه‌سازی پایان یافت: " +
+        faNum(libraryReadyIds.size) + " از " + faNum(libraryRecords.length) + " فایل آماده است." +
+        (chunkedReady ? " " + faNum(chunkedReady) + " فایل با ذخیرۀ صفحه‌به‌صفحه آماده شد." : "") +
+        (corpusReport.lexiconSize ? " واژه‌نامۀ تطبیقی شامل " + faNum(corpusReport.lexiconSize) + " واژۀ مطمئن است." : "") +
+        (failedPages ? " " + faNum(failedPages) + " صفحۀ مسئله‌دار پس از دو تلاش خالی علامت‌گذاری شد تا بقیۀ سند قابل جست‌وجو بماند." : "") +
+        (failures.length ? " " + faNum(failures.length) + " فایل کامل نشد؛ پیشرفت فایل‌های بزرگ ذخیره شده و با اجرای دوباره ادامه می‌یابد." : "")
       );
 
       renderDocuments();
@@ -27111,6 +28363,25 @@ item => item.id === recordId
       folderBtn.disabled = false;
       updateStats();
     }
+  }
+
+  async function ensureLibraryIndexedBeforeSearch(engine) {
+    const missing = libraryRecords.filter(record =>
+      !isRecordIndexReady(record, engine.version)
+    );
+
+    if (!missing.length) return { indexed: false, missingBefore: 0 };
+
+    setLibraryStatus(
+      "برای اینکه جست‌وجو بدون خطا نتیجه بدهد، ابتدا صف نمایه‌سازی " +
+      faNum(missing.length) +
+      " فایلِ جدید/تغییرکرده اجرا می‌شود؛ مسیر سریع متنی فعال است و OCR خودکار اجرا نمی‌شود."
+    );
+
+    await indexAll();
+    await refreshLibrary();
+
+    return { indexed: true, missingBefore: missing.length };
   }
 
   async function searchLibrary() {
@@ -27140,7 +28411,14 @@ item => item.id === recordId
       const engine = await waitForPDFEngine();
       await engine.ensure();
 
-      if (archiveNeedsCorpusModel()) {
+      // از این نسخه، جست‌وجوی کتابخانه دیگر کاربر را با پیامِ «نمایه ندارید» رها نمی‌کند.
+      // اگر فایل جدید/تغییرکرده وجود داشته باشد، همین‌جا صف نمایه‌سازی مقاوم اجرا می‌شود
+      // و بعد جست‌وجو روی نمایۀ ذخیره‌شده انجام می‌گیرد.
+      await ensureLibraryIndexedBeforeSearch(engine);
+
+      // Speed lock v23: جست‌وجو باید فوراً روی نمایۀ آماده انجام شود؛
+      // ساخت لایۀ تطبیقی، عملیات کیفیتی جداست و قبل از هر جست‌وجو اجرا نمی‌شود.
+      if (false && archiveNeedsCorpusModel()) {
         setLibraryStatus(
           "در حال ساخت لایۀ تطبیقی v19 از نمایۀ موجود؛ OCR دوباره اجرا نمی‌شود…"
         );
@@ -27149,6 +28427,7 @@ item => item.id === recordId
       }
 
       const found = [];
+      let unindexedCount = 0;
 
       for (let i = 0; i < libraryRecords.length; i++) {
         const record = libraryRecords[i];
@@ -27159,20 +28438,56 @@ item => item.id === recordId
         );
 
         try {
-          let index = record.index;
+          if (!isRecordIndexReady(record, engine.version)) {
+            unindexedCount++;
+          } else {
+            const result = isChunkedIndex(record.index, engine.version)
+              ? await searchChunkedRecord(record, wantedWord, engine)
+              : engine.searchIndex(record.index, wantedWord);
 
-          if (
-            !index ||
-            !Array.isArray(index.pages) ||
-            index.engineVersion !== engine.version
-          ) {
-            index = await indexRecord(record);
+            if (result.totalMatches > 0 || result.probableMatches > 0) {
+              found.push({
+                id: record.id,
+                name: record.name,
+                totalMatches: result.totalMatches,
+                probableMatches: result.probableMatches,
+                pages: result.pages,
+                exactPages: result.exactPages,
+                probablePages: result.probablePages
+              });
+            }
           }
 
-          const result = engine.searchIndex(index, wantedWord);
+        } catch (fileError) {
+          console.error("Archive search failed for:", record.name, fileError);
+        }
 
+        setProgress(Math.round(((i + 1) / libraryRecords.length) * 100));
+      }
+
+      let onDemandOCRSkipped = 0;
+      let onDemandOCRProcessed = 0;
+      let onDemandOCRRemaining = 0;
+      let onDemandOCRPartial = false;
+
+      // Accuracy pass v27: fast text search may find one page while other scanned pages
+      // still need OCR. Therefore this pass runs even when some hits already exist,
+      // updates cached page shards, and then re-searches the affected record for full count.
+      for (const record of libraryRecords) {
+        if (!isRecordIndexReady(record, engine.version) || !isChunkedIndex(record.index, engine.version)) continue;
+        const ocrResult = await runOnDemandOCRForSearch(record, wantedWord, engine);
+        if (!ocrResult) continue;
+        if (ocrResult.skipped) {
+          onDemandOCRSkipped++;
+          continue;
+        }
+        onDemandOCRProcessed += Number(ocrResult.processed) || 0;
+        onDemandOCRRemaining += Number(ocrResult.remaining) || 0;
+        if (ocrResult.partial) onDemandOCRPartial = true;
+        if (ocrResult.found) {
+          const result = await searchChunkedRecord(record, wantedWord, engine);
           if (result.totalMatches > 0 || result.probableMatches > 0) {
-            found.push({
+            const payload = {
               id: record.id,
               name: record.name,
               totalMatches: result.totalMatches,
@@ -27180,14 +28495,12 @@ item => item.id === recordId
               pages: result.pages,
               exactPages: result.exactPages,
               probablePages: result.probablePages
-            });
+            };
+            const existingIndex = found.findIndex(item => item.id === record.id);
+            if (existingIndex >= 0) found[existingIndex] = payload;
+            else found.push(payload);
           }
-
-        } catch (fileError) {
-          console.error("Archive search failed for:", record.name, fileError);
-}
-
-        setProgress(Math.round(((i + 1) / libraryRecords.length) * 100));
+        }
       }
 
       found.sort((a, b) => {
@@ -27214,19 +28527,31 @@ item => item.id === recordId
           faNum(exactHits) + " نتیجۀ دقیق برای «" + wantedWord + "» پیدا شد" +
           (probableHits
             ? "؛ " + faNum(probableHits) + " مورد احتمالی OCR نیز وجود دارد و فقط در صورت انتخاب شما نمایش داده می‌شود."
-            : ".")
+            : ".") +
+          (onDemandOCRPartial ? " OCR اسکن‌شده به‌صورت مرحله‌ای ادامه دارد؛ برای تکمیل شمارش، همین جست‌وجو را دوباره بزنید." : "") +
+          (unindexedCount ? " " + faNum(unindexedCount) + " فایلِ بدون نمایۀ کامل جست‌وجو نشد." : "")
         );
       } else if (probableHits > 0) {
         setLibraryStatus(
           "نتیجۀ قطعی برای «" + wantedWord + "» پیدا نشد؛ " +
           faNum(probableHits) +
-          " کاندیدای احتمالی OCR وجود دارد. برای دیدن آن‌ها گزینۀ «نمایش موارد احتمالی OCR» را فعال کنید."
+          " کاندیدای احتمالی OCR وجود دارد. برای دیدن آن‌ها گزینۀ «نمایش موارد احتمالی OCR» را فعال کنید." +
+          (unindexedCount ? " " + faNum(unindexedCount) + " فایلِ بدون نمایۀ کامل جست‌وجو نشد." : "")
         );
       } else {
         setLibraryStatus(
-          "برای «" + wantedWord + "» در " +
-          faNum(libraryRecords.length) +
-          " فایل نه نتیجۀ دقیق و نه کاندیدای قابل‌قبول OCR پیدا نشد."
+          unindexedCount === libraryRecords.length
+            ? "برای «" + wantedWord + "» پس از نمایه‌سازی و بررسی OCR نتیجه‌ای پیدا نشد."
+            : (
+                (
+                  onDemandOCRPartial
+                    ? "تا این مرحله برای «" + wantedWord + "» نتیجه‌ای پیدا نشد؛ " + faNum(onDemandOCRProcessed) + " صفحه با OCR سریع بررسی شد و " + faNum(onDemandOCRRemaining) + " صفحهٔ اسکن‌شده برای بسته‌های بعدی باقی مانده است. برای ادامه، همین جست‌وجو را دوباره بزنید."
+                    : "برای «" + wantedWord + "» در فایل‌های نمایه‌شده نتیجه‌ای پیدا نشد."
+                ) +
+                (!onDemandOCRPartial && onDemandOCRProcessed ? " " + faNum(onDemandOCRProcessed) + " صفحۀ اسکن‌شده هم با OCR سریع بررسی شد." : "") +
+                (onDemandOCRSkipped ? " برخی صفحات به دلیل خطای فنی مرورگر بررسی نشدند." : "") +
+                (unindexedCount ? " " + faNum(unindexedCount) + " فایلِ بدون نمایۀ کامل جست‌وجو نشد." : "")
+              )
         );
       }
 
@@ -27268,8 +28593,17 @@ item => item.id === recordId
       const engine = await waitForPDFEngine();
       const file = await getRecordFile(record);
 
-      if (!record.index || !Array.isArray(record.index.pages)) {
-        record.index = await indexRecord(record);
+      if (!isRecordIndexReady(record, engine.version)) {
+        throw new Error("نمایۀ این فایل هنوز کامل نیست؛ ابتدا نمایه‌سازی را کامل کنید.");
+      }
+
+      let pageIndexOverride = null;
+      if (isChunkedIndex(record.index, engine.version)) {
+        const shard = await dbGetPageShard(record.id, viewerPageNumber);
+        if (!shard?.pageIndex) {
+          throw new Error("نمایۀ همین صفحه در ذخیره‌سازی محلی پیدا نشد؛ نمایه‌سازی را دوباره اجرا کنید.");
+        }
+        pageIndexOverride = shard.pageIndex;
       }
 
       const targetWidth = Math.max(
@@ -27288,7 +28622,8 @@ item => item.id === recordId
           : String(queryOverride || ""),
         viewerCanvas,
         targetWidth,
-        matchMode
+        matchMode,
+        pageIndexOverride
       );
 
       viewerPageNumber = info.pageNumber;
@@ -27345,6 +28680,27 @@ item => item.id === recordId
     }
   }
 
+  if (addFilesControl && window.showOpenFilePicker) {
+    addFilesControl.addEventListener("click", async event => {
+      event.preventDefault();
+      try {
+        const handles = await window.showOpenFilePicker({
+          multiple: true,
+          id: "pazand-personal-library-pdfs",
+          types: [{
+            description: "PDF",
+            accept: { "application/pdf": [".pdf"] }
+          }]
+        });
+        await saveFileHandles(handles);
+      } catch (error) {
+        if (error?.name === "AbortError") return;
+        console.warn("Direct PDF picker unavailable; using input fallback.", error);
+        input.click();
+      }
+    });
+  }
+
   input.addEventListener("change", () => saveFiles(input.files));
 
   folderBtn.addEventListener("click", chooseFolder);
@@ -27372,7 +28728,12 @@ item => item.id === recordId
         const probableHits = currentSearchResults.reduce(
           (sum, item) => sum + Number(item.probableMatches || 0), 0
         );
-        if (probableHits > 0) setLibraryStatus(faNum(probableHits) + " مورد احتمالی OCR اکنون جدا از نتایج قطعی نمایش داده می‌شود.");
+        if (probableHits > 0) {
+          setLibraryStatus(faNum(probableHits) + " مورد احتمالی OCR اکنون جدا از نتایج قطعی نمایش داده می‌شود.");
+        } else {
+          setLibraryStatus("برای نمایش موارد احتمالی، جست‌وجوی سبکِ احتمالی دوباره اجرا می‌شود…");
+          searchLibrary();
+        }
       }
     });
   }
@@ -27649,80 +29010,136 @@ item => item.id === recordId
 
 
 <div id="arminScrollSigil" aria-hidden="true">
-  <span class="sigil-label">ARMIN / SCROLL</span>
+  <span class="sigil-label">PAZAND / SHIRDAL</span>
 
   <svg viewBox="0 0 220 220" role="presentation">
     <!--
-      طرح: "مُهرِ نسخه / شمسهٔ معماری"
-      عمداً هشت‌ضلعی نمونه نیست.
-      هر ضلع و هر اتصال یک <line> مستقل است.
+      PAZAND scroll sigil: stylized Persian griffin (شیردال).
+      The same whole-page scroll engine draws every real <line> progressively.
+      At 100% scroll, the complete griffin is revealed.
     -->
-
-    <!-- 01–08: crosshair foundation -->
-    <line class="sigil-line pale" x1="110" y1="22" x2="110" y2="58"/>
-    <line class="sigil-line pale" x1="110" y1="162" x2="110" y2="198"/>
-    <line class="sigil-line pale" x1="22" y1="110" x2="58" y2="110"/>
-    <line class="sigil-line pale" x1="162" y1="110" x2="198" y2="110"/>
-    <line class="sigil-line gold-soft" x1="47" y1="47" x2="73" y2="73"/>
-    <line class="sigil-line gold-soft" x1="147" y1="147" x2="173" y2="173"/>
-    <line class="sigil-line gold-soft" x1="173" y1="47" x2="147" y2="73"/>
-    <line class="sigil-line gold-soft" x1="73" y1="147" x2="47" y2="173"/>
-
-    <!-- 09–20: manuscript star arms -->
-    <line class="sigil-line gold" x1="110" y1="58" x2="126" y2="88"/>
-    <line class="sigil-line gold" x1="126" y1="88" x2="162" y2="110"/>
-    <line class="sigil-line gold" x1="162" y1="110" x2="132" y2="126"/>
-    <line class="sigil-line gold" x1="132" y1="126" x2="110" y2="162"/>
-    <line class="sigil-line gold" x1="110" y1="162" x2="94" y2="132"/>
-    <line class="sigil-line gold" x1="94" y1="132" x2="58" y2="110"/>
-    <line class="sigil-line gold" x1="58" y1="110" x2="88" y2="94"/>
-    <line class="sigil-line gold" x1="88" y1="94" x2="110" y2="58"/>
-    <line class="sigil-line teal-soft" x1="73" y1="73" x2="88" y2="94"/>
-    <line class="sigil-line teal-soft" x1="147" y1="73" x2="126" y2="88"/>
-    <line class="sigil-line teal-soft" x1="147" y1="147" x2="132" y2="126"/>
-    <line class="sigil-line teal-soft" x1="73" y1="147" x2="94" y2="132"/>
-
-    <!-- 21–32: inner manuscript knot -->
-    <line class="sigil-line teal" x1="88" y1="94" x2="110" y2="100"/>
-    <line class="sigil-line teal" x1="110" y1="100" x2="126" y2="88"/>
-    <line class="sigil-line teal" x1="126" y1="88" x2="120" y2="110"/>
-    <line class="sigil-line teal" x1="120" y1="110" x2="132" y2="126"/>
-    <line class="sigil-line teal" x1="132" y1="126" x2="110" y2="120"/>
-    <line class="sigil-line teal" x1="110" y1="120" x2="94" y2="132"/>
-    <line class="sigil-line teal" x1="94" y1="132" x2="100" y2="110"/>
-    <line class="sigil-line teal" x1="100" y1="110" x2="88" y2="94"/>
-    <line class="sigil-line gold-soft" x1="100" y1="110" x2="110" y2="100"/>
-    <line class="sigil-line gold-soft" x1="110" y1="100" x2="120" y2="110"/>
-    <line class="sigil-line gold-soft" x1="120" y1="110" x2="110" y2="120"/>
-    <line class="sigil-line gold-soft" x1="110" y1="120" x2="100" y2="110"/>
-
-    <!-- 33–44: catalogue / archive rays -->
-    <line class="sigil-line pale" x1="110" y1="22" x2="92" y2="46"/>
-    <line class="sigil-line pale" x1="110" y1="22" x2="128" y2="46"/>
-    <line class="sigil-line pale" x1="198" y1="110" x2="174" y2="92"/>
-    <line class="sigil-line pale" x1="198" y1="110" x2="174" y2="128"/>
-    <line class="sigil-line pale" x1="110" y1="198" x2="92" y2="174"/>
-    <line class="sigil-line pale" x1="110" y1="198" x2="128" y2="174"/>
-    <line class="sigil-line pale" x1="22" y1="110" x2="46" y2="92"/>
-    <line class="sigil-line pale" x1="22" y1="110" x2="46" y2="128"/>
-    <line class="sigil-line teal-soft" x1="92" y1="46" x2="73" y2="73"/>
-    <line class="sigil-line teal-soft" x1="128" y1="46" x2="147" y2="73"/>
-    <line class="sigil-line teal-soft" x1="128" y1="174" x2="147" y2="147"/>
-    <line class="sigil-line teal-soft" x1="92" y1="174" x2="73" y2="147"/>
-
-    <!-- 45–56: final outer accents -->
-    <line class="sigil-line gold-soft" x1="47" y1="47" x2="92" y2="46"/>
-    <line class="sigil-line gold-soft" x1="92" y1="46" x2="110" y2="58"/>
-    <line class="sigil-line gold-soft" x1="128" y1="46" x2="173" y2="47"/>
-    <line class="sigil-line gold-soft" x1="110" y1="58" x2="128" y2="46"/>
-    <line class="sigil-line gold-soft" x1="173" y1="173" x2="128" y2="174"/>
-    <line class="sigil-line gold-soft" x1="128" y1="174" x2="110" y2="162"/>
-    <line class="sigil-line gold-soft" x1="92" y1="174" x2="47" y2="173"/>
-    <line class="sigil-line gold-soft" x1="110" y1="162" x2="92" y2="174"/>
-    <line class="sigil-line teal" x1="46" y1="92" x2="58" y2="110"/>
-    <line class="sigil-line teal" x1="46" y1="128" x2="58" y2="110"/>
-    <line class="sigil-line teal" x1="174" y1="92" x2="162" y2="110"/>
-    <line class="sigil-line teal" x1="174" y1="128" x2="162" y2="110"/>
+    <line class="sigil-line gold" x1="69" y1="120" x2="82" y2="108"/>
+    <line class="sigil-line gold" x1="82" y1="108" x2="103" y2="103"/>
+    <line class="sigil-line gold" x1="103" y1="103" x2="126" y2="104"/>
+    <line class="sigil-line gold" x1="126" y1="104" x2="145" y2="111"/>
+    <line class="sigil-line gold" x1="145" y1="111" x2="154" y2="124"/>
+    <line class="sigil-line gold" x1="154" y1="124" x2="151" y2="137"/>
+    <line class="sigil-line gold" x1="151" y1="137" x2="138" y2="146"/>
+    <line class="sigil-line gold" x1="138" y1="146" x2="116" y2="149"/>
+    <line class="sigil-line gold" x1="116" y1="149" x2="95" y2="146"/>
+    <line class="sigil-line gold" x1="95" y1="146" x2="78" y2="138"/>
+    <line class="sigil-line gold" x1="78" y1="138" x2="69" y2="120"/>
+    <line class="sigil-line gold" x1="145" y1="112" x2="151" y2="98"/>
+    <line class="sigil-line gold" x1="151" y1="98" x2="153" y2="83"/>
+    <line class="sigil-line gold" x1="153" y1="83" x2="159" y2="70"/>
+    <line class="sigil-line gold" x1="159" y1="70" x2="168" y2="61"/>
+    <line class="sigil-line gold" x1="168" y1="61" x2="180" y2="57"/>
+    <line class="sigil-line gold" x1="180" y1="57" x2="190" y2="60"/>
+    <line class="sigil-line gold" x1="190" y1="60" x2="199" y2="59"/>
+    <line class="sigil-line gold" x1="199" y1="59" x2="192" y2="66"/>
+    <line class="sigil-line gold" x1="192" y1="66" x2="181" y2="69"/>
+    <line class="sigil-line gold" x1="181" y1="69" x2="174" y2="77"/>
+    <line class="sigil-line gold" x1="174" y1="77" x2="169" y2="91"/>
+    <line class="sigil-line gold" x1="169" y1="91" x2="166" y2="106"/>
+    <line class="sigil-line gold" x1="166" y1="106" x2="158" y2="121"/>
+    <line class="sigil-line gold-soft" x1="180" y1="57" x2="191" y2="54"/>
+    <line class="sigil-line gold-soft" x1="191" y1="54" x2="204" y2="58"/>
+    <line class="sigil-line gold-soft" x1="204" y1="58" x2="194" y2="62"/>
+    <line class="sigil-line gold-soft" x1="194" y1="62" x2="199" y2="66"/>
+    <line class="sigil-line gold-soft" x1="199" y1="66" x2="187" y2="66"/>
+    <line class="sigil-line gold-soft" x1="163" y1="68" x2="166" y2="58"/>
+    <line class="sigil-line gold-soft" x1="166" y1="58" x2="171" y2="51"/>
+    <line class="sigil-line gold-soft" x1="171" y1="51" x2="175" y2="61"/>
+    <line class="sigil-line teal-soft" x1="168" y1="62" x2="176" y2="54"/>
+    <line class="sigil-line teal-soft" x1="176" y1="54" x2="181" y2="58"/>
+    <line class="sigil-line teal" x1="177" y1="61" x2="181" y2="61"/>
+    <line class="sigil-line teal" x1="179" y1="59" x2="179" y2="63"/>
+    <line class="sigil-line pale" x1="171" y1="69" x2="184" y2="67"/>
+    <line class="sigil-line pale" x1="168" y1="75" x2="179" y2="74"/>
+    <line class="sigil-line gold" x1="158" y1="121" x2="162" y2="134"/>
+    <line class="sigil-line gold" x1="162" y1="134" x2="158" y2="146"/>
+    <line class="sigil-line gold" x1="158" y1="146" x2="151" y2="155"/>
+    <line class="sigil-line gold" x1="139" y1="112" x2="130" y2="92"/>
+    <line class="sigil-line gold" x1="130" y1="92" x2="118" y2="72"/>
+    <line class="sigil-line gold" x1="118" y1="72" x2="103" y2="54"/>
+    <line class="sigil-line gold" x1="103" y1="54" x2="87" y2="47"/>
+    <line class="sigil-line gold" x1="87" y1="47" x2="74" y2="51"/>
+    <line class="sigil-line gold" x1="74" y1="51" x2="78" y2="62"/>
+    <line class="sigil-line gold" x1="78" y1="62" x2="92" y2="72"/>
+    <line class="sigil-line gold" x1="92" y1="72" x2="103" y2="86"/>
+    <line class="sigil-line gold" x1="103" y1="86" x2="111" y2="105"/>
+    <line class="sigil-line gold" x1="111" y1="105" x2="121" y2="122"/>
+    <line class="sigil-line gold-soft" x1="130" y1="92" x2="143" y2="82"/>
+    <line class="sigil-line gold-soft" x1="143" y1="82" x2="153" y2="84"/>
+    <line class="sigil-line gold-soft" x1="153" y1="84" x2="147" y2="94"/>
+    <line class="sigil-line gold-soft" x1="147" y1="94" x2="139" y2="112"/>
+    <line class="sigil-line teal-soft" x1="121" y1="119" x2="84" y2="58"/>
+    <line class="sigil-line teal-soft" x1="121" y1="119" x2="90" y2="64"/>
+    <line class="sigil-line teal-soft" x1="121" y1="119" x2="97" y2="70"/>
+    <line class="sigil-line teal-soft" x1="121" y1="119" x2="104" y2="77"/>
+    <line class="sigil-line teal-soft" x1="121" y1="119" x2="111" y2="85"/>
+    <line class="sigil-line teal-soft" x1="121" y1="119" x2="118" y2="94"/>
+    <line class="sigil-line teal-soft" x1="121" y1="119" x2="125" y2="103"/>
+    <line class="sigil-line pale" x1="88" y1="68" x2="97" y2="63"/>
+    <line class="sigil-line pale" x1="97" y1="63" x2="106" y2="63"/>
+    <line class="sigil-line pale" x1="96" y1="79" x2="106" y2="73"/>
+    <line class="sigil-line pale" x1="106" y1="73" x2="116" y2="73"/>
+    <line class="sigil-line pale" x1="104" y1="91" x2="114" y2="84"/>
+    <line class="sigil-line pale" x1="114" y1="84" x2="126" y2="84"/>
+    <line class="sigil-line gold" x1="145" y1="145" x2="148" y2="160"/>
+    <line class="sigil-line gold" x1="148" y1="160" x2="146" y2="174"/>
+    <line class="sigil-line gold" x1="146" y1="174" x2="142" y2="184"/>
+    <line class="sigil-line gold-soft" x1="142" y1="184" x2="135" y2="190"/>
+    <line class="sigil-line gold-soft" x1="142" y1="184" x2="142" y2="192"/>
+    <line class="sigil-line gold-soft" x1="142" y1="184" x2="150" y2="189"/>
+    <line class="sigil-line teal-soft" x1="148" y1="160" x2="155" y2="168"/>
+    <line class="sigil-line gold" x1="112" y1="149" x2="111" y2="163"/>
+    <line class="sigil-line gold" x1="111" y1="163" x2="104" y2="175"/>
+    <line class="sigil-line gold" x1="104" y1="175" x2="105" y2="187"/>
+    <line class="sigil-line gold-soft" x1="105" y1="187" x2="96" y2="189"/>
+    <line class="sigil-line gold-soft" x1="105" y1="187" x2="105" y2="191"/>
+    <line class="sigil-line gold-soft" x1="105" y1="187" x2="113" y2="189"/>
+    <line class="sigil-line pale" x1="111" y1="163" x2="119" y2="168"/>
+    <line class="sigil-line teal" x1="87" y1="138" x2="105" y2="133"/>
+    <line class="sigil-line teal" x1="105" y1="133" x2="127" y2="134"/>
+    <line class="sigil-line teal" x1="127" y1="134" x2="145" y2="129"/>
+    <line class="sigil-line pale" x1="92" y1="120" x2="111" y2="114"/>
+    <line class="sigil-line pale" x1="111" y1="114" x2="135" y2="116"/>
+    <line class="sigil-line gold-soft" x1="129" y1="106" x2="138" y2="119"/>
+    <line class="sigil-line gold-soft" x1="138" y1="119" x2="137" y2="136"/>
+    <line class="sigil-line gold" x1="77" y1="136" x2="61" y2="140"/>
+    <line class="sigil-line gold" x1="61" y1="140" x2="47" y2="137"/>
+    <line class="sigil-line gold" x1="47" y1="137" x2="38" y2="128"/>
+    <line class="sigil-line gold" x1="38" y1="128" x2="34" y2="116"/>
+    <line class="sigil-line gold" x1="34" y1="116" x2="38" y2="104"/>
+    <line class="sigil-line gold" x1="38" y1="104" x2="48" y2="96"/>
+    <line class="sigil-line gold" x1="48" y1="96" x2="59" y2="95"/>
+    <line class="sigil-line gold" x1="59" y1="95" x2="67" y2="102"/>
+    <line class="sigil-line gold" x1="67" y1="102" x2="65" y2="111"/>
+    <line class="sigil-line gold" x1="65" y1="111" x2="57" y2="115"/>
+    <line class="sigil-line gold" x1="57" y1="115" x2="49" y2="111"/>
+    <line class="sigil-line gold" x1="49" y1="111" x2="47" y2="105"/>
+    <line class="sigil-line gold-soft" x1="47" y1="105" x2="37" y2="98"/>
+    <line class="sigil-line gold-soft" x1="47" y1="105" x2="39" y2="108"/>
+    <line class="sigil-line gold-soft" x1="47" y1="105" x2="43" y2="116"/>
+    <line class="sigil-line teal-soft" x1="38" y1="104" x2="30" y2="108"/>
+    <line class="sigil-line teal" x1="91" y1="113" x2="99" y2="108"/>
+    <line class="sigil-line teal" x1="99" y1="108" x2="107" y2="113"/>
+    <line class="sigil-line teal" x1="107" y1="113" x2="99" y2="118"/>
+    <line class="sigil-line teal" x1="99" y1="118" x2="91" y2="113"/>
+    <line class="sigil-line teal" x1="119" y1="124" x2="126" y2="119"/>
+    <line class="sigil-line teal" x1="126" y1="119" x2="133" y2="124"/>
+    <line class="sigil-line teal" x1="133" y1="124" x2="126" y2="130"/>
+    <line class="sigil-line teal" x1="126" y1="130" x2="119" y2="124"/>
+    <line class="sigil-line pale" x1="83" y1="127" x2="89" y2="121"/>
+    <line class="sigil-line pale" x1="83" y1="127" x2="89" y2="133"/>
+    <line class="sigil-line pale" x1="136" y1="139" x2="143" y2="134"/>
+    <line class="sigil-line teal" x1="126" y1="97" x2="131" y2="92"/>
+    <line class="sigil-line teal" x1="131" y1="92" x2="136" y2="97"/>
+    <line class="sigil-line teal" x1="136" y1="97" x2="131" y2="102"/>
+    <line class="sigil-line teal" x1="131" y1="102" x2="126" y2="97"/>
+    <line class="sigil-line gold-soft" x1="131" y1="92" x2="131" y2="85"/>
+    <line class="sigil-line gold-soft" x1="136" y1="97" x2="143" y2="97"/>
   </svg>
 
   <span class="sigil-progress">0%</span>
@@ -27798,6 +29215,8 @@ item => item.id === recordId
         line.style.strokeDashoffset = `${L}`;
       }
     });
+
+    root.classList.toggle("complete", p >= 0.999);
 
     if(label){
       label.textContent = `${Math.round(p * 100)}%`;
@@ -31518,3 +32937,5 @@ return {geom,chars};
 </body>
 
 </html>
+
+```
